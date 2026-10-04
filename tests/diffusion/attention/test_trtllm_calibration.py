@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 
@@ -222,3 +222,218 @@ def test_apply_to_pipeline_routes_and_ignores():
     assert impl("transformer", 1, "attn2").stamped is None
 
     assert impl("transformer", 0, "attn1").stamped is None
+
+
+def test_apply_to_pipeline_stamps_all_schedule_candidates():
+    """KTD8: every prepared candidate impl gets the same per-layer calibration as the baseline."""
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
+
+    attn = nn.Module()
+    attn.attention = _FakeImpl()
+    c1, c2 = _FakeImpl(), _FakeImpl()
+    attn._schedule_candidates = {"p1": SimpleNamespace(impl=c1), "p2": SimpleNamespace(impl=c2)}
+    pipe = nn.Module()
+    pipe.attn = attn
+
+    stamped = apply_to_pipeline(pipe, {"a": 1.5, "b": 2.5})
+
+    assert attn.attention.stamped == pytest.approx((1.5, 2.5))
+    assert c1.stamped == pytest.approx((1.5, 2.5))
+    assert c2.stamped == pytest.approx((1.5, 2.5))
+    assert stamped == 3
+
+
+def test_apply_to_pipeline_stamps_trtllm_candidate_under_dense_baseline():
+    """KTD8: a skip-softmax candidate under a dense baseline is still calibrated.
+
+    The pre-slice-2 code keyed off module.attention having set_layer_calibration and
+    skipped the whole layer otherwise, so a dense baseline with a TRTLLM candidate
+    would leave that candidate uncalibrated.
+    """
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
+
+    attn = nn.Module()
+    attn.attention = object()  # dense baseline impl without set_layer_calibration
+    cand = _FakeImpl()
+    attn._schedule_candidates = {"sparse": SimpleNamespace(impl=cand)}
+    pipe = nn.Module()
+    pipe.attn = attn
+
+    stamped = apply_to_pipeline(pipe, {"a": 9.0, "b": 1.0})
+
+    assert cand.stamped == pytest.approx((9.0, 1.0))
+    assert stamped == 1
+
+
+def test_apply_to_pipeline_ignored_layer_skips_baseline_and_candidates():
+    """An ignored layer calibrates neither baseline nor candidates (legitimate dense fallback)."""
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
+
+    attn = nn.Module()
+    attn.attention = _FakeImpl()
+    cand = _FakeImpl()
+    attn._schedule_candidates = {"p": SimpleNamespace(impl=cand)}
+    pipe = nn.Module()
+    pipe.transformer = attn
+
+    calib = {"by_expert": {"transformer": {"a": 1.0, "b": 2.0, "ignore": ["transformer"]}}}
+    stamped = apply_to_pipeline(pipe, calib)
+
+    assert attn.attention.stamped is None
+    assert cand.stamped is None
+    assert stamped == 0
+
+
+# --- U2 slice-3: calibration discovery must reach schedule-only profiles (KTD8) ----
+
+
+def test_collect_calibration_specs_covers_baseline_and_every_profile():
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import collect_calibration_specs
+    from vllm_omni.diffusion.data import (
+        AttentionConfig,
+        AttentionScheduleConfig,
+        AttentionSpec,
+    )
+
+    baseline_spec = AttentionSpec(backend="TRTLLM_ATTN")
+    role_spec = AttentionSpec(backend="TRTLLM_ATTN")
+    profile_spec = AttentionSpec(backend="TRTLLM_ATTN")
+    cfg = AttentionConfig(default=baseline_spec, per_role={"self": role_spec})
+    schedule = AttentionScheduleConfig(
+        profiles={"p": AttentionConfig(default=profile_spec)},
+        default=[{"start": 0, "end": None, "profile": "p"}],
+    )
+
+    specs = collect_calibration_specs(cfg, schedule)
+
+    # Identity, not equality: AttentionSpec is a dataclass, so equal fields would hide a copy.
+    assert [id(s) for s in specs[:2]] == [id(baseline_spec), id(role_spec)]
+    # AttentionScheduleConfig detaches its profiles, so the schedule holds its own copy of the
+    # profile spec. The helper must return THAT object: it is the one calibration gets assigned
+    # to and the one prepared candidates resolve from.
+    held = schedule.profiles["p"].default
+    assert specs[2] is held
+    assert specs[2] == profile_spec
+    assert specs[2] is not profile_spec
+    assert [id(s) for s in collect_calibration_specs(cfg, None)] == [id(baseline_spec), id(role_spec)]
+
+
+def test_apply_skip_softmax_calibration_discovers_profile_only_calibration():
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_skip_softmax_calibration
+    from vllm_omni.diffusion.data import (
+        AttentionConfig,
+        AttentionScheduleConfig,
+        AttentionSpec,
+        SkipSoftmaxSpec,
+    )
+
+    calibration = {"by_expert": {"attn": {"a": 1.5, "b": 2.5}}}
+    profile_spec = AttentionSpec(
+        backend="TRTLLM_ATTN",
+        skip_softmax=SkipSoftmaxSpec(target_sparsity=0.5),
+        skip_calibration=calibration,
+    )
+    schedule = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=profile_spec)},
+        default=[{"start": 0, "end": None, "profile": "sparse"}],
+    )
+    baseline_cfg = AttentionConfig()  # dense baseline: no skip_softmax anywhere
+
+    attn = nn.Module()
+    attn.attention = object()  # dense baseline impl without set_layer_calibration
+    cand = _FakeImpl()
+    attn._schedule_candidates = {"sparse": SimpleNamespace(impl=cand)}
+    pipe = nn.Module()
+    pipe.attn = attn
+
+    # Characterization: without the schedule the baseline-only discovery finds no calibration.
+    apply_skip_softmax_calibration(baseline_cfg, pipe)
+    assert cand.stamped is None
+
+    apply_skip_softmax_calibration(baseline_cfg, pipe, schedule=schedule)
+    assert cand.stamped == pytest.approx((1.5, 2.5))
+
+
+def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
+    # Second-review finding #1: a candidate with its own skip_calibration must not receive the
+    # first dict. The baseline still receives that fallback.
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
+    from vllm_omni.diffusion.data import AttentionSpec
+
+    attn = nn.Module()
+    attn.attention = _FakeImpl()
+    own = _FakeImpl()
+    fallback_only = _FakeImpl()
+    attn._schedule_candidates = {
+        "own": SimpleNamespace(
+            impl=own,
+            spec=AttentionSpec(
+                backend="TRTLLM_ATTN",
+                skip_calibration={"by_expert": {"attn": {"a": 9.0, "b": 8.0}}},
+            ),
+        ),
+        "fallback": SimpleNamespace(impl=fallback_only, spec=None),
+    }
+    pipe = nn.Module()
+    pipe.attn = attn
+
+    stamped = apply_to_pipeline(pipe, {"by_expert": {"attn": {"a": 1.0, "b": 2.0}}})
+
+    assert attn.attention.stamped == pytest.approx((1.0, 2.0))
+    assert own.stamped == pytest.approx((9.0, 8.0))
+    assert fallback_only.stamped == pytest.approx((1.0, 2.0))
+    assert stamped == 3
+
+
+def test_apply_to_pipeline_counts_a_shared_impl_once():
+    # Second-review finding #4: two profile names that share one impl are one stamp, not two.
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
+
+    attn = nn.Module()
+    attn.attention = _FakeImpl()
+    shared = _FakeImpl()
+    record = SimpleNamespace(impl=shared, spec=None)
+    attn._schedule_candidates = {"a": record, "b": record}
+    pipe = nn.Module()
+    pipe.attn = attn
+
+    stamped = apply_to_pipeline(pipe, {"a": 1.5, "b": 2.5})
+
+    assert shared.stamped == pytest.approx((1.5, 2.5))
+    assert stamped == 2
+
+
+def test_layer_calibration_is_ignored_distinguishes_ignored_from_missing_curve():
+    from vllm_omni.diffusion.attention.backends.trtllm_calibration import layer_calibration_is_ignored
+
+    calibration = {"by_expert": {"transformer": {"a": 1.0, "b": 2.0, "ignore": ["blocks.*.attn2"]}}}
+
+    assert layer_calibration_is_ignored("transformer.blocks.0.attn2", calibration) is True
+    assert layer_calibration_is_ignored("transformer.blocks.0.attn1", calibration) is False
+    # A layer whose expert carries no curve is missing calibration, not legitimately ignored.
+    assert layer_calibration_is_ignored("transformer_2.blocks.0.attn1", calibration) is False
+    assert layer_calibration_is_ignored("transformer.blocks.0.attn1", None) is False

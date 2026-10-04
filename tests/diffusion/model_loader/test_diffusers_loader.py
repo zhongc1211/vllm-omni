@@ -2293,3 +2293,58 @@ def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpo
     else:
         assert result.plan is None
         assert "no checkpoint binding" in result.fallback_reason
+
+
+# --- U2 slice-3: the loader must hand the schedule to calibration and run KTD6 validation ---
+
+
+def _schedule_loader(schedule) -> DiffusersPipelineLoader:
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        parallel_config=SimpleNamespace(use_hsdp=False),
+        quantization_config=None,
+        diffusion_attention_config=None,
+        diffusion_attention_schedule=schedule,
+    )
+    return DiffusersPipelineLoader(LoadConfig(), od_config)
+
+
+def test_loader_passes_schedule_to_calibration_and_validates_candidates(monkeypatch):
+    import vllm_omni.diffusion.attention.backends.trtllm_calibration as calib_mod
+    import vllm_omni.diffusion.attention.layer as layer_mod
+
+    schedule = SimpleNamespace(profiles={"p": SimpleNamespace()})
+    loader = _schedule_loader(schedule)
+    model = nn.Module()
+    calls = {}
+
+    def _fake_apply(cfg, pipeline, schedule=None):
+        calls["calibration"] = (cfg, schedule)
+
+    def _fake_validate(pipeline, od_config):
+        calls["validate"] = (pipeline, od_config)
+        return 7
+
+    monkeypatch.setattr(calib_mod, "apply_skip_softmax_calibration", _fake_apply)
+    monkeypatch.setattr(layer_mod, "validate_attention_schedule_candidates", _fake_validate)
+
+    loader._apply_skip_softmax_calibration(model)
+    validated = loader._validate_attention_schedule_candidates(model)
+
+    assert calls["calibration"][1] is schedule
+    assert validated == 7
+    assert calls["validate"][0] is model
+    assert calls["validate"][1] is loader.od_config
+
+
+def test_loader_skips_candidate_validation_without_schedule(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as layer_mod
+
+    loader = _schedule_loader(None)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("no schedule configured: the traversal must not run")
+
+    monkeypatch.setattr(layer_mod, "validate_attention_schedule_candidates", _must_not_run)
+
+    assert loader._validate_attention_schedule_candidates(nn.Module()) == 0

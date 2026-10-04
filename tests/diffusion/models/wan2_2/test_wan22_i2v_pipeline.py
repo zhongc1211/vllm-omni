@@ -10,6 +10,8 @@ from PIL import Image
 from torch import nn
 
 from tests.diffusion.models.wan2_2.conftest import StubScheduler, StubTransformer, StubVAE, noop_progress_bar
+from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import _WAN_TEXT_ENCODER_OFFLOAD_PLAN, build_wan_scheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_i2v import (
     Wan22I2VPipeline,
@@ -229,6 +231,64 @@ def test_i2v_diffuse_selects_stage_guidance_and_expands_timesteps() -> None:
         torch.ones_like(calls[0]["hidden_states"][:, :, 0]),
     )
     torch.testing.assert_close(result, torch.full_like(latents, 2.0))
+
+
+def _denoise_progress():
+    context = get_forward_context()
+    return context.denoise_step_idx, context.total_denoise_steps, context.attention_schedule_denoise_active
+
+
+def _run_i2v_diffuse_with_schedule(pipeline, schedule, calls):
+    latents = torch.zeros(1, 4, 1, 2, 2)
+
+    def fake_predict_noise_maybe_with_cfg(**kwargs):
+        calls.append((kwargs["positive_kwargs"]["current_model"].name, *_denoise_progress()))
+        return torch.zeros_like(latents)
+
+    pipeline.predict_noise_maybe_with_cfg = fake_predict_noise_maybe_with_cfg  # type: ignore[method-assign]
+    pipeline.scheduler_step_maybe_with_cfg = lambda noise, t, current, cfg: current  # type: ignore[method-assign]
+    with set_forward_context(), bind_attention_schedule(schedule):
+        pipeline.diffuse(
+            latents=latents,
+            timesteps=torch.tensor([900, 500, 100]),
+            prompt_embeds=torch.zeros(1, 2, 3),
+            negative_prompt_embeds=None,
+            image_embeds=None,
+            guidance_low=1.0,
+            guidance_high=1.0,
+            boundary_timestep=600.0,
+            dtype=torch.float32,
+            attention_kwargs={},
+            condition=torch.zeros_like(latents),
+            first_frame_mask=torch.ones(1, 1, 1, 2, 2),
+        )
+        return _denoise_progress()
+
+
+@pytest.mark.parametrize("scheduled", [True, False], ids=["scheduled", "unscheduled"])
+def test_i2v_diffuse_publishes_schedule_total_and_clears_after_loop(scheduled: bool) -> None:
+    pipeline = _make_i2v_pipeline(expand_timesteps=False)
+    calls: list[tuple[object, ...]] = []
+    schedule = (AttentionScheduleRange(start=1, end=None, profile="candidate"),) if scheduled else None
+
+    after = _run_i2v_diffuse_with_schedule(pipeline, schedule, calls)
+
+    total = 3 if scheduled else None
+    # The expert changes at the numeric boundary (600); the step index still counts every step.
+    assert calls == [("high", 0, total, scheduled), ("low", 1, total, scheduled), ("low", 2, total, scheduled)]
+    # Without a schedule the last step stays published after the loop, as before.
+    assert after == ((None, None, False) if scheduled else (2, None, False))
+
+
+def test_i2v_diffuse_rejects_schedule_past_actual_total_before_first_forward() -> None:
+    pipeline = _make_i2v_pipeline(expand_timesteps=False)
+    calls: list[tuple[object, ...]] = []
+    schedule = (AttentionScheduleRange(start=2, end=4, profile="candidate"),)
+
+    with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=3"):
+        _run_i2v_diffuse_with_schedule(pipeline, schedule, calls)
+
+    assert calls == []
 
 
 def test_i2v_prepare_latents_builds_expand_condition_and_first_frame_mask() -> None:

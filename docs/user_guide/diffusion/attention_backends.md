@@ -21,6 +21,7 @@ For the internal selector, registry, and platform contract, see
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
+| Switch the attention configuration at fixed denoising steps | [Attention Schedules](attention_backends/schedules.md) |
 
 ## Backend options
 
@@ -148,6 +149,19 @@ Override the platform default when you need:
 The startup log prints the resolved backend and whether it came from explicit
 configuration or platform defaulting. If no resolution message appears, check
 earlier logs for diffusion-stage initialization failures.
+
+## Attention schedules
+
+`--diffusion-attention-schedule` declares named attention profiles and assigns
+them to ranges of denoising step indices. Steps that no range covers use the
+configuration described on this page. A request can replace or disable the
+server's default ranges with the `attention_schedule` field.
+
+The code accepts schedules for MiniMax-H3, Wan2.2, and HunyuanImage-3.0. No
+request with a schedule has been run on these models; see
+[Verification status](attention_backends/schedules.md#verification-status).
+[Attention Schedules](attention_backends/schedules.md) describes the format,
+the request field, the compatibility limits, and the effect on compilation.
 
 ## Reference benchmark
 

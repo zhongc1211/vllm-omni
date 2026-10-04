@@ -67,6 +67,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     tts_entry_stage_archs,
 )
 from vllm_omni.entrypoints.utils import coerce_param_message_types
+from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
 from vllm_omni.metrics.modality import observe_audio_first_packet, observe_audio_streaming_finalize
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.utils.speaker_cache import get_speaker_cache
@@ -2442,6 +2443,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 if sampling_params_list[0].extra_args is None:
                     sampling_params_list[0].extra_args = {}
                 sampling_params_list[0].extra_args.update(extra)
+                try:
+                    # The request value replaces a schedule the stage default sampling params carried.
+                    absorb_attention_schedule_extra_args(sampling_params_list[0], override=True)
+                except TypeError as exc:
+                    raise ValueError(str(exc)) from exc
 
                 sampling = sampling_params_list[0]
 

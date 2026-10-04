@@ -62,6 +62,7 @@ from vllm_omni.inputs.data import (
     OmniInteractionEvent,
     OmniInteractionPrompt,
     OmniTextPrompt,
+    absorb_attention_schedule_extra_args,
 )
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.output_metadata import DiffusionPayloadValue
@@ -601,6 +602,12 @@ class OmniStreamingVideoOutputHandler:
                     detail="preencode_mp4 is not supported for streaming video sessions.",
                 )
             gen_params.extra_args.update(request.extra_params)
+            try:
+                # The inline stage client's clone() does not re-run __post_init__, so move the
+                # schedule onto the typed field here; the request value replaces a stage default.
+                absorb_attention_schedule_extra_args(gen_params, override=True)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail=str(exc)) from exc
 
         self._apply_lora(request.lora, gen_params)
         return prompt, gen_params, vp

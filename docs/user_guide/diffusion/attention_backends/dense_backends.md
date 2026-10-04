@@ -71,6 +71,14 @@ compatible.
 vllm-omni serve <model> --diffusion-attention-backend CUDNN_ATTN
 ```
 
+### Float32 inputs
+
+For key/value sequences longer than one token, `CUDNN_ATTN` restricts PyTorch
+SDPA to the cuDNN kernel, which requires float16 or bfloat16 inputs. With
+PyTorch 2.13.0+cu130 on an sm_120 GPU, a float32 call failed with
+`RuntimeError: No available kernel. Aborting execution.` Use `TORCH_SDPA` for
+float32 attention.
+
 ### LTX-2.0 limitation
 
 LTX-2 audio attention has a symbolic head dimension during `torch.compile`

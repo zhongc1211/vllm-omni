@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Tests for Ulysses + Ring sequence-parallel attention correctness.
 
@@ -27,6 +27,7 @@ do not exercise the full model-registry pipeline.
 import os
 import pickle
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -39,6 +40,9 @@ from vllm_omni.diffusion.attention.parallel.allgather_kv import (
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
     DiffusionParallelConfig,
     OmniDiffusionConfig,
 )
@@ -815,3 +819,130 @@ def ulysses_attention_on_test_model(
             )
 
         destroy_distributed_env()
+
+
+# --- U2 slice-3: SP auto-pad capability probe must see every prepared candidate ----
+#
+# Auto-pad decides mask support before Attention layers exist, so it probes the selector
+# instead of a live backend. With a step schedule the runtime may switch to a prepared
+# candidate, so a probe that only reads the baseline config can approve a padding layout
+# that the selected candidate cannot execute (KTD6: fail at startup, not in the kernel).
+
+
+def _cap_backend(name: str, mask: bool):
+    """A backend class double exposing only the two capability queries the probe uses."""
+    return type(
+        name,
+        (),
+        {
+            "get_name": classmethod(lambda cls: name),
+            "supports_attention_mask": classmethod(lambda cls, spec=None: mask),
+        },
+    )
+
+
+def _auto_pad_hook():
+    from vllm_omni.diffusion.distributed.sp_plan import (
+        SequenceParallelConfig,
+        SequenceParallelInput,
+    )
+    from vllm_omni.diffusion.hooks.sequence_parallel import SequenceParallelSplitHook
+
+    metadata = {"hidden_states": SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=True)}
+    return SequenceParallelSplitHook(metadata, SequenceParallelConfig(ulysses_degree=2))
+
+
+def _patch_sp_env(monkeypatch, *, od_config, world_size=2, rank=0):
+    import vllm_omni.diffusion.distributed.parallel_state as parallel_state
+    import vllm_omni.diffusion.forward_context as forward_context
+
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: world_size)
+    monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: rank)
+    monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
+    ctx = SimpleNamespace(
+        omni_diffusion_config=od_config,
+        sp_shard_metadata={},
+        sp_padding_size=None,
+        sp_original_seq_len=None,
+    )
+    monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(forward_context, "get_forward_context", lambda: ctx)
+    return ctx
+
+
+def test_auto_pad_probe_rejects_schedule_profile_without_mask_support(monkeypatch):
+    import vllm_omni.diffusion.attention.selector as selector
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(),
+        diffusion_attention_schedule=SimpleNamespace(profiles={"sparse": AttentionConfig()}),
+    )
+    _patch_sp_env(monkeypatch, od_config=od_config)
+    monkeypatch.setattr(
+        selector,
+        "resolve_capability_backends",
+        lambda **kwargs: [
+            ("baseline", _cap_backend("SDPA", True), None),
+            ("profile:sparse", _cap_backend("TRTLLM_ATTN", False), None),
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"profile 'sparse'.*attention_mask"):
+        _auto_pad_hook()._shard_with_auto_pad(torch.zeros((1, 5, 4)), 1, None)
+
+
+def test_auto_pad_probe_pads_when_every_profile_supports_mask(monkeypatch):
+    import vllm_omni.diffusion.attention.selector as selector
+
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(),
+        diffusion_attention_schedule=SimpleNamespace(profiles={"sparse": AttentionConfig()}),
+    )
+    ctx = _patch_sp_env(monkeypatch, od_config=od_config)
+    monkeypatch.setattr(
+        selector,
+        "resolve_capability_backends",
+        lambda **kwargs: [
+            ("baseline", _cap_backend("SDPA", True), None),
+            ("profile:sparse", _cap_backend("CUDNN_ATTN", True), None),
+        ],
+    )
+
+    out = _auto_pad_hook()._shard_with_auto_pad(torch.zeros((1, 5, 4)), 1, None)
+
+    assert out.shape[1] == 3  # 5 padded to 6, rank 0 keeps the first half
+    assert ctx.sp_original_seq_len == 5
+    assert ctx.sp_padding_size == 1
+
+
+def test_auto_pad_probe_keeps_baseline_message_without_schedule(monkeypatch):
+    # Characterization: with no schedule the baseline-only wording must not change.
+    import vllm_omni.diffusion.attention.selector as selector
+
+    od_config = SimpleNamespace(diffusion_attention_config=AttentionConfig(), diffusion_attention_schedule=None)
+    _patch_sp_env(monkeypatch, od_config=od_config)
+    monkeypatch.setattr(
+        selector,
+        "resolve_capability_backends",
+        lambda **kwargs: [("baseline", _cap_backend("TRTLLM_ATTN", False), None)],
+    )
+
+    with pytest.raises(ValueError, match="Please switch to SDPA or Ascend attention backend"):
+        _auto_pad_hook()._shard_with_auto_pad(torch.zeros((1, 5, 4)), 1, None)
+
+
+def test_auto_pad_probe_enumerates_real_schedule_profiles(monkeypatch):
+    # End-to-end through the real selector: the probe must ask about the profile, not just the
+    # baseline, so a mask-free profile is rejected without any test double in the seam.
+    schedule = AttentionScheduleConfig(
+        profiles={"mask_free": AttentionConfig(default=AttentionSpec(backend="TRTLLM_ATTN"))},
+        default=[{"start": 0, "end": None, "profile": "mask_free"}],
+    )
+    od_config = SimpleNamespace(
+        diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN")),
+        diffusion_attention_schedule=schedule,
+    )
+    _patch_sp_env(monkeypatch, od_config=od_config)
+
+    with pytest.raises(ValueError, match=r"profile 'mask_free'"):
+        _auto_pad_hook()._shard_with_auto_pad(torch.zeros((1, 5, 4)), 1, None)
