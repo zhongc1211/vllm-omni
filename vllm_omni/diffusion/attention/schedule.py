@@ -105,7 +105,7 @@ def validate_attention_schedule(
 
 
 def require_attention_schedule_fits(schedule: AttentionSchedule, total_steps: int) -> None:
-    """Reject, as a client error, a schedule whose ranges do not fit the actual denoise sequence (AE4).
+    """Reject, as a client error, a schedule whose ranges do not fit the actual denoise sequence.
 
     Publishers call this once they know the sequence they will run and before its first denoise
     forward. The actual total can differ from the requested num_inference_steps (fixed DMD tables,
@@ -180,7 +180,7 @@ def require_no_cache_backend(od_config: Any, schedule: AttentionSchedule) -> Non
 
     TeaCache-style backends skip DiT evaluations on some steps and add a residual cached at an
     earlier step, which may have run a different profile. The selected attention would then not be
-    what ran, so the combination is rejected (KTD6) instead of invalidating caches at profile switches.
+    what ran, so the combination is rejected instead of invalidating caches at profile switches.
     """
     if not schedule:
         return

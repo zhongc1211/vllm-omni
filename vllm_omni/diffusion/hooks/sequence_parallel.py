@@ -461,9 +461,9 @@ class SequenceParallelSplitHook(ModelHook):
             # Keyed groups record their length even when no padding is needed.
             return sp_shard(x, dim, validate=False)
 
-        # Check backend compatibility for the baseline AND every prepared schedule candidate:
-        # the runtime may switch to a candidate mid-denoise, so a padding layout is only usable
-        # if every candidate can consume the mask (KTD6).
+        # Check backend compatibility for the baseline AND every schedule profile with an explicit
+        # spec: the runtime may switch to a profile mid-denoise, so a padding layout is only usable
+        # if each of them can consume the mask.
         attention_config = None
         schedule = None
         if is_forward_context_available():

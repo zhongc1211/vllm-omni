@@ -91,10 +91,10 @@ def _try_extract_layer_index(prefix: str) -> int | None:
 
 @dataclass(frozen=True)
 class _PreparedCandidate:
-    """A pre-constructed per-profile attention candidate (U2 slice-1, KTD4).
+    """A pre-constructed per-profile attention candidate.
 
     Carries the resolved backend class, spec, impl class and constructed impl so
-    slice-2 calibration, slice-3 capability validation and U3 runtime selection can
+    calibration, startup capability validation and runtime selection can
     use them without re-resolving. Deduplicated profiles share one instance, so the
     record intentionally carries no single profile name (the dict key is the name).
     """
@@ -170,15 +170,15 @@ class Attention(nn.Module):
 
         self._has_custom_attention = custom_attention is not None
 
-        # U2 (KTD4): per-step schedule candidates. Empty unless a startup schedule
-        # is configured, so the no-schedule construction path is unchanged and no
-        # extra impl is built. AttentionImpl is not an nn.Module, so keeping these
-        # in a plain dict registers no submodule and leaves state_dict untouched.
+        # Per-step schedule candidates. Empty unless a startup schedule
+        # is configured, so without a schedule no extra impl is built.
+        # AttentionImpl is not an nn.Module, so keeping these in a plain dict
+        # registers no submodule and leaves state_dict untouched.
         self._schedule_profiles: tuple[str, ...] = ()
         self._schedule_candidates: dict[str, _PreparedCandidate] = {}
         # Whether this layer saw a schedule at construction. Attention can be built with no current
         # diffusion config, and such a layer legitimately prepares no candidates, so startup
-        # validation must not report it as a missing profile (review finding #7).
+        # validation must not report it as a missing profile.
         self._schedule_configured: bool = False
         # Model-owned requirements on every candidate of this layer (add_schedule_candidate_check).
         self._schedule_candidate_checks: list[Callable[[_PreparedCandidate], str | None]] = []
@@ -298,7 +298,7 @@ class Attention(nn.Module):
                 num_kv_heads=num_kv_heads,
                 qkv_layout=qkv_layout,
             )
-            # U2 (KTD4): pre-construct one deduplicated candidate per configured
+            # Pre-construct one deduplicated candidate per configured
             # profile. Runs only when a startup schedule exists; the baseline impl
             # above is never replaced and stays the gap/no-selection choice.
             schedule_config = getattr(config, "diffusion_attention_schedule", None) if config is not None else None
@@ -329,7 +329,7 @@ class Attention(nn.Module):
                 raise ValueError("custom_attention must own its communication and requires skip_sequence_parallel=True")
             schedule_config = getattr(config, "diffusion_attention_schedule", None) if config is not None else None
             if schedule_config is not None:
-                # KTD6: a model-owned kernel cannot represent prepared per-step
+                # A model-owned kernel cannot represent prepared per-step
                 # candidates, so reject at construction, not inside the first kernel.
                 raise ValueError(
                     "diffusion_attention_schedule cannot be combined with custom_attention: a model-owned "
@@ -404,21 +404,22 @@ class Attention(nn.Module):
         skip_sequence_parallel: bool,
         allgather_degree: int,
     ) -> None:
-        """Pre-construct one deduplicated candidate record per configured profile (U2, KTD4).
+        """Pre-construct one deduplicated candidate record per configured profile.
 
         Candidates are additional prepared objects only; the baseline impl built in
         ``__init__`` is never replaced and remains the gap/no-selection choice. Each
         profile is resolved independently through the same role-aware selector, so it
-        keeps its own role precedence and never merges the baseline (KTD1). Profiles
+        keeps its own role precedence and never merges the baseline. Profiles
         not referenced by the service default schedule are still prepared, because
-        startup compatibility validation (KTD6) covers every configured profile.
+        startup compatibility validation covers every configured profile.
 
         The baseline construction-time guards that decide WHICH backend a layer uses
         are reproduced here, so a candidate is never prepared with a wrong or
         incompatible backend: the marked-paged default->FLASH_ATTN promotion and the
         AllGather-KV + TRTLLM_ATTN rejection. Per-candidate KV-cache-quantization and
         capability/layout validation (ring, paged representability, kv dtype support)
-        remain a slice-3 post-load startup traversal (KTD6) and are not duplicated here.
+        remain in the post-load startup traversal (``validate_attention_schedule_candidates``)
+        and are not duplicated here.
 
         Identical effective identities for this role share one record. The dedup key carries the
         backend name, explicit-vs-default selection, the impl class object, and canonical JSON of
@@ -607,7 +608,7 @@ class Attention(nn.Module):
         attn_metadata: AttentionMetadata | None = None,
     ) -> torch.Tensor:
         if torch.compiler.is_compiling() and getattr(self, "_schedule_configured", False):
-            # KTD7: selecting a scheduled candidate reads the step, the total and the bound
+            # Selecting a scheduled candidate reads the step, the total and the bound
             # schedule from the forward context, and backend-private gates read the step or
             # timestep. Traced, those values would become guards and each new step or range
             # boundary would recompile the enclosing graph. The decision uses only the
@@ -638,10 +639,22 @@ class Attention(nn.Module):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None,
     ) -> ExecutionPathResult:
-        """Compose backend capabilities with outer Attention boundaries."""
+        """Compose backend capabilities with outer Attention boundaries.
+
+        On a layer built with a schedule, a call inside an active denoise step applies the step
+        and profile checks of ``forward`` and raises the same errors.
+        """
         boundaries = set(context.outer_boundaries)
         if self._uses_hsdp_compile_boundary():
             boundaries.add(OuterBoundary.HSDP)
+        attention = self.attention
+        if getattr(self, "_schedule_configured", False):
+            # While compiling, a layer built with a schedule always runs behind
+            # _forward_schedule_compile_boundary, and inside a denoise step it runs the candidate
+            # selected for that step. effective_attention() returns the baseline when there is no
+            # forward context, and otherwise applies the same step and profile checks as forward.
+            boundaries.add(OuterBoundary.ATTENTION_SCHEDULE)
+            attention = self.effective_attention()[0]
         active_strategy = self._get_active_parallel_strategy()
         strategy_name = active_strategy.name
         if self.use_ring and active_strategy.enabled and strategy_name == "ulysses":
@@ -659,10 +672,10 @@ class Attention(nn.Module):
             paged_kv=self.is_paged_kv_active(),
             parallel_strategy=parallel_strategy,
         )
-        resolver = getattr(self.attention, "resolve_execution_path", None)
+        resolver = getattr(attention, "resolve_execution_path", None)
         if not callable(resolver):
             return ExecutionPathResult.unmigrated(
-                type(self.attention).__name__,
+                type(attention).__name__,
                 resolved_context,
             )
         if not resolved_context.paged_kv:
@@ -883,7 +896,7 @@ class Attention(nn.Module):
         return not explicit and cast(type[AttentionBackend], backend).get_name() == "FLASH_ATTN"
 
     def add_schedule_candidate_check(self, check: Callable[[_PreparedCandidate], str | None]) -> None:
-        """Register a model-owned requirement that startup validation applies to every candidate (KTD6).
+        """Register a model-owned requirement that startup validation applies to every candidate.
 
         ``check(record)`` returns None when the candidate is usable on this layer, or the reason it is
         not. Models use it for decisions the generic traversal cannot see, such as a layout the model
@@ -979,8 +992,8 @@ def _sp_plan_declares_auto_pad(value) -> bool:
 
     ``SequenceParallelInputType`` is itself a dict (parameter name or output index -> input spec,
     optionally a list/tuple of them), and in-tree models declare plans shaped like
-    ``{"rope": {0: SequenceParallelInput(..., auto_pad=True)}}`` (wan2_2_transformer.py:850-858), so
-    auto_pad normally sits two levels below the plan root. Duck-typed on the entry so this module
+    ``{"rope": {0: SequenceParallelInput(..., auto_pad=True)}}`` (``WanTransformer3DModel._sp_plan``),
+    so auto_pad normally sits two levels below the plan root. Duck-typed on the entry so this module
     does not import the SP plan types.
     """
     if isinstance(value, dict):
@@ -995,7 +1008,7 @@ def _sp_auto_pad_roots(model: nn.Module) -> tuple[str, ...]:
 
     SP hooks are applied per component: the registry reads each transformer's ``_sp_plan`` and
     applies hooks to that transformer only. A plan on one component must therefore not impose mask
-    support on another component's layers (review finding #2), so coverage is decided by qualified
+    support on another component's layers, so coverage is decided by qualified
     name prefix rather than by "any module anywhere pads". The root module yields the empty name,
     which covers every layer. Duck-typed so this module does not import the SP plan types.
     """
@@ -1020,13 +1033,13 @@ def _validate_candidate_calibration(
     record: "_PreparedCandidate",
     effective_calibration: dict | None,
 ) -> None:
-    """KTD8: a candidate that asked for ``target_sparsity`` needs a curve for THIS layer.
+    """A candidate that asked for ``target_sparsity`` needs a curve for THIS layer.
 
-    The curve is resolved from ``effective_calibration`` - the single dict that
-    ``apply_skip_softmax_calibration`` stamps onto every impl - not from the candidate's own spec,
-    so validation answers the same question stamping does (review finding #6). An ignore-rule hit is
-    a preserved legitimate dense fallback and passes; a layer the effective dict gives no curve for
-    would silently stay dense at runtime, so it is rejected at startup.
+    ``effective_calibration`` is the dict that stamping writes onto this candidate. The caller passes
+    ``calibration_for_candidate(record, fallback)``: the candidate's own ``skip_calibration`` when it
+    has one, otherwise the fallback dict, so validation answers the same question stamping does. An
+    ignore-rule hit is a preserved legitimate dense fallback and passes; a layer that dict gives no
+    curve for would silently stay dense at runtime, so it is rejected at startup.
     """
     spec = record.spec
     if spec is None:
@@ -1054,19 +1067,21 @@ def _validate_candidate_calibration(
 
 
 def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
-    """KTD6 post-load startup traversal over every prepared schedule candidate.
+    """Post-load startup traversal over every prepared schedule candidate.
 
     Construction (``Attention._prepare_schedule_candidates``) reproduces the guards that decide
     WHICH backend a layer uses. The checks here need the loaded model and the resolved parallel
-    plan instead, and today each of them keys off the baseline only - so an incompatible candidate
-    would surface inside the first kernel after U3 switches to it:
+    plan instead. The checks that run without this traversal do not read each prepared candidate,
+    so an incompatible candidate would surface inside the first kernel after the layer switches to
+    it, be ignored on a paged KV or ring layer, or run dense when its calibration curve is missing:
 
     * profile coverage: every configured profile is prepared on every attention layer, including
       profiles the service default never references;
     * paged KV: an explicit profile is never promoted, so a non-paged backend survives
-      construction and would raise in ``_forward_impl``. Paged forward runs the native
-      implementation bound to the baseline, so a candidate whose backend name, explicit selection
-      or backend kwargs differ from the baseline cannot be represented either;
+      construction, and ``_forward_impl`` checks only the baseline backend for paged support.
+      Paged forward runs the native implementation bound to the baseline, so a candidate whose
+      backend name, explicit selection or backend kwargs differ from the baseline cannot be
+      represented either;
     * KV-cache quantization: ``_init_kv_cache_quantization`` probes the baseline impl only;
     * SP auto-pad: the pad-time mask probe cannot be answered per candidate before load, so a layer
       inside a component that plans auto_pad under SP must have mask-capable candidates. Coverage is
@@ -1076,11 +1091,11 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
       or differing from the baseline in backend name, explicit selection or backend kwargs cannot be
       represented;
     * calibration: a candidate asking for ``target_sparsity`` needs a curve for its own layer in the
-      single calibration dict that stamping actually applies.
+      calibration dict that stamping writes onto that candidate.
 
     Returns the number of validated candidates. Without a schedule this returns 0 immediately and
-    walks nothing, so the no-schedule load path is unchanged. A schedule that finds no attention
-    layer, or no layer that saw it, is rejected instead of passing silently (review finding #9).
+    walks nothing. A schedule that finds no attention layer, or no layer that saw it, is rejected
+    instead of passing silently.
     """
     from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
         calibration_for_candidate,
@@ -1144,7 +1159,7 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
                     f"or disable scheduler paged KV."
                 )
             if paged and not matches_baseline:
-                # KTD6: forward_paged runs the native implementation bound to the baseline and never
+                # forward_paged runs the native implementation bound to the baseline and never
                 # reads the candidate's spec, so a different candidate would be silently ignored.
                 raise ValueError(
                     f"attention schedule profile {name!r} selects backend {backend_name} "
@@ -1156,7 +1171,7 @@ def validate_attention_schedule_candidates(model: nn.Module, od_config) -> int:
                     f"baseline or disable scheduler paged KV."
                 )
             if ring_degree > 1 and not module.skip_sequence_parallel:
-                # KTD6: the ring path bypasses the backend, so a candidate carrying skip_softmax
+                # The ring path bypasses the backend, so a candidate carrying skip_softmax
                 # would be silently ignored (_run_ring_attention only reads the baseline impl). The
                 # ring runner was constructed once from the baseline backend preference and explicit
                 # flag and never reads backend kwargs: an explicit candidate over an automatic

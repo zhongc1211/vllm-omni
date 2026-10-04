@@ -463,13 +463,13 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         logger.info("Model runner: Initialization complete.")
 
     def _validate_service_attention_schedule(self) -> None:
-        """R6: fail startup when configured profiles can never run on this service.
+        """Fail startup when configured profiles can never run on this service.
 
         Every scheduled request is rejected before denoise on a pipeline that does not publish denoise
         progress, and while ``od_config.cache_backend`` names a cache backend, including one the pipeline
         adopts per request (request-scoped Cache-DiT). Configured profiles fail startup in both cases,
         even with an empty default, because they would still make each attention layer call an eager
-        boundary while compiling (KTD7), which a ``fullgraph=True`` compile cannot contain. A non-empty
+        boundary while compiling, which a ``fullgraph=True`` compile cannot contain. A non-empty
         default needs profiles, so this also covers every request inheriting the default. Runs after the
         cache backend is final, because a model without cache acceleration clears
         ``od_config.cache_backend``. Otherwise an empty default keeps loading: requests can still opt in

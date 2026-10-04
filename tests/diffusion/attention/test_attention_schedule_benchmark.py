@@ -5,7 +5,7 @@
 
 The harness decides from session records whether a run proves a step-index attention schedule. Most
 tests here build session records by hand and check the decision of each rule: complete evidence gives
-success, and each defect (a shifted boundary, an all-dense candidate, an all-fallback candidate, an
+success, and each defect (a switch at another step, an all-dense candidate, an all-fallback candidate, an
 eager run, a broken output, changed reference conditions) blocks it. Other tests cover the capture
 store, the probes on small fake modules, and ``run_session`` against a fake service that sends the
 capture store the events the probes would send.
@@ -446,7 +446,7 @@ def _not_passing(result: dict[str, Any]) -> dict[str, Any]:
 
 def _summary(result: dict[str, Any]) -> str:
     """Return the summary of a matrix in which the other five combinations are proven."""
-    passing = {"status": "success", "items": {"AE5_boundary": {"status": "pass"}}, "report": {}}
+    passing = {"status": "success", "items": {"shifted_boundary": {"status": "pass"}}, "report": {}}
     combinations: dict[str, Any] = dict.fromkeys(bench.COMBINATIONS, passing)
     combinations[result["combination"] or "C1"] = result
     return bench.render_summary(combinations, bench.evaluate_matrix(combinations))
@@ -1055,7 +1055,7 @@ def test_complete_evidence_is_success(make_sessions):
         for name in bench.REQUIRED_ITEMS:
             assert result["items"][name]["status"] == "pass", name
             assert result["items"][name]["evidence"], name
-        assert result["items"]["AE5_boundary"]["status"] == "pass"
+        assert result["items"]["shifted_boundary"]["status"] == "pass"
         assert result["report"]["no_schedule"] == {"bit_identical": True}
         assert result["report"]["reference_vs_plain"] == {"bit_identical": True}
         results[combination] = result
@@ -1066,9 +1066,9 @@ def test_complete_evidence_is_success(make_sessions):
     assert matrix == {
         "status": "success",
         "missing": [],
-        "ae5": {"status": "pass", "combinations": list(bench.COMBINATIONS), "failed": []},
+        "shifted_boundary": {"status": "pass", "combinations": list(bench.COMBINATIONS), "failed": []},
     }
-    assert summary.splitlines()[0] == "R7-R10: SUCCESS"
+    assert summary.splitlines()[0] == "Acceptance: SUCCESS"
     assert summary.count("SUCCESS") == 1
     assert "  LPIPS 0.12 (alex, 2 frames)" in summary
 
@@ -1097,14 +1097,14 @@ def test_every_evidence_pointer_is_load_bearing(make_sessions, combination):
     assert checked > 10 * len(bench.REQUIRED_ITEMS)
 
     # The shifted-boundary item is not required of every combination, so only the item is checked.
-    shifted_evidence = baseline["items"]["AE5_boundary"]["evidence"]
+    shifted_evidence = baseline["items"]["shifted_boundary"]["evidence"]
     assert len(shifted_evidence) > 10
     for reference in shifted_evidence:
         file_name, _, pointer = reference.partition("#")
         changed = copy.deepcopy(sessions)
         _put(changed[session_of[file_name]], pointer, _DROP)
 
-        assert _evaluate(changed, directory)["items"]["AE5_boundary"]["status"] != "pass", reference
+        assert _evaluate(changed, directory)["items"]["shifted_boundary"]["status"] != "pass", reference
 
 
 @pytest.mark.parametrize(
@@ -1115,14 +1115,14 @@ def test_every_evidence_pointer_is_load_bearing(make_sessions, combination):
         pytest.param(0, 1, "not_proven", "no_divergence_at_switch", id="output-changes-one-step-late"),
     ],
 )
-def test_shifted_boundary_is_detected(make_sessions, select_shift, diverge_shift, status, reason):
+def test_switch_at_another_step_is_detected(make_sessions, select_shift, diverge_shift, status, reason):
     switch = 3
     sessions, directory = make_sessions("C1", switch=switch)
     _rebuild(sessions, directory, _CA, select_from=switch + select_shift, diverge_from=switch + diverge_shift)
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["R7_switch"]
+    item = result["items"]["profile_switch"]
     assert (item["status"], item["reasons"]) == (status, [reason])
     assert result["status"] == "not_success"
     assert "SUCCESS" not in _summary(result)
@@ -1134,7 +1134,7 @@ def test_dense_prefix_rule_needs_a_dense_step_before_the_switch(make_sessions, s
     # validate_config rejects these schedules, so only a record that was edited reaches the rule with one.
     _put(sessions["scheduled"], "/config/candidate_schedule", schedule)
 
-    item = bench._rule_r9_dense_prefix(sessions["scheduled"])
+    item = bench._rule_dense_prefix(sessions["scheduled"])
 
     assert (item["status"], item["reasons"]) == ("not_proven", ["no_dense_prefix"])
     assert item["values"] == {"first_switch": switch}
@@ -1147,10 +1147,10 @@ def test_output_change_before_the_switch_fails_the_dense_prefix(make_sessions):
 
     result = _evaluate(sessions, directory)
 
-    prefix = result["items"]["R9_dense_prefix"]
+    prefix = result["items"]["dense_prefix"]
     assert (prefix["status"], prefix["reasons"]) == ("fail", ["prefix_differs"])
     assert prefix["values"] == {"first_switch": switch, "first_differing_step": switch - 1}
-    assert result["items"]["R7_switch"]["values"]["first_differing_step"] == switch - 1
+    assert result["items"]["profile_switch"]["values"]["first_differing_step"] == switch - 1
 
 
 def test_late_layer_switch_names_the_step(make_sessions):
@@ -1158,7 +1158,7 @@ def test_late_layer_switch_names_the_step(make_sessions):
     sessions, directory = make_sessions("C1", switch=switch)
     _rebuild(sessions, directory, _CA, select_from=switch + 1, diverge_from=switch + 1)
 
-    item = _evaluate(sessions, directory)["items"]["R7_switch"]
+    item = _evaluate(sessions, directory)["items"]["profile_switch"]
 
     assert item["values"]["steps"] == [{"sequence": 0, "step": switch, "problem": "expected_profile"}]
 
@@ -1177,7 +1177,7 @@ def test_all_dense_candidate_is_detected(make_sessions, index, select_from, stat
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["R7_switch"]
+    item = result["items"]["profile_switch"]
     assert (item["status"], item["reasons"]) == (status, [reason])
     assert result["status"] == "not_success"
     assert "SUCCESS" not in _summary(result)
@@ -1188,7 +1188,7 @@ def test_early_layer_switch_names_the_step(make_sessions):
     sessions, directory = make_sessions("C1", switch=switch)
     _rebuild(sessions, directory, _CA, select_from=switch - 1, diverge_from=switch)
 
-    item = _evaluate(sessions, directory)["items"]["R7_switch"]
+    item = _evaluate(sessions, directory)["items"]["profile_switch"]
 
     assert (item["status"], item["reasons"]) == ("fail", ["selection_mismatch"])
     assert item["values"]["steps"] == [{"sequence": 0, "step": switch - 1, "problem": "expected_baseline"}]
@@ -1201,7 +1201,7 @@ def test_approximate_kernel_call_on_a_dense_step_is_a_mismatch(make_sessions):
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["R7_switch"]
+    item = result["items"]["profile_switch"]
     assert (item["status"], item["reasons"]) == ("fail", ["selection_mismatch"])
     assert item["values"]["steps"] == [{"sequence": 0, "step": 1, "problem": "approximate_kernel_on_dense_step"}]
     assert result["status"] == "not_success"
@@ -1228,7 +1228,7 @@ def test_switch_rule_reads_the_recorded_selection(make_sessions, step, edits, pr
     for key, value in edits.items():
         _put(sessions["scheduled"], f"/requests/{_CA}/sequences/0/steps/{step}/attention/{key}", value)
 
-    item = _evaluate(sessions, directory)["items"]["R7_switch"]
+    item = _evaluate(sessions, directory)["items"]["profile_switch"]
 
     if problem is None:
         assert (item["status"], item["reasons"]) == ("pass", [])
@@ -1241,7 +1241,7 @@ def test_switch_rule_needs_an_attention_record_on_every_step(make_sessions):
     sessions, directory = make_sessions("C1", switch=3)
     _put(sessions["scheduled"], f"/requests/{_CA}/sequences/0/steps/4/attention", None)
 
-    item = _evaluate(sessions, directory)["items"]["R7_switch"]
+    item = _evaluate(sessions, directory)["items"]["profile_switch"]
 
     assert (item["status"], item["reasons"]) == ("fail", ["selection_mismatch"])
     assert item["values"]["steps"] == [{"sequence": 0, "step": 4, "problem": "attention_not_recorded"}]
@@ -1258,15 +1258,15 @@ def test_switch_rule_reads_every_sequence(make_sessions):
 
     # One sequence of the candidate switches one step late: sequence 0 first, then sequence 1.
     _steps(sessions, _CA)[3]["attention"] = _attention(None)
-    first = _evaluate(sessions, directory)["items"]["R7_switch"]
+    first = _evaluate(sessions, directory)["items"]["profile_switch"]
     sessions["scheduled"]["requests"][_CA]["sequences"].reverse()
-    second = _evaluate(sessions, directory)["items"]["R7_switch"]
+    second = _evaluate(sessions, directory)["items"]["profile_switch"]
 
     assert first["values"]["steps"] == [{"sequence": 0, "step": 3, "problem": "expected_profile"}]
     assert second["values"]["steps"] == [{"sequence": 1, "step": 3, "problem": "expected_profile"}]
 
 
-@pytest.mark.parametrize("reason", ["short_kv", "ignored_layer", "private_gate", "layer_fallback"])
+@pytest.mark.parametrize("reason", ["sage_not_applied", "ignored_layer", "private_gate", "layer_fallback"])
 def test_all_fallback_is_not_proven(make_sessions, reason):
     steps, switch = 8, 3
     sessions, directory = make_sessions("C2", steps=steps, switch=switch)
@@ -1275,12 +1275,12 @@ def test_all_fallback_is_not_proven(make_sessions, reason):
 
     result = _evaluate(sessions, directory)
 
-    target = result["items"]["R10_target"]
+    target = result["items"]["kernel_target"]
     assert (target["status"], target["reasons"]) == ("not_proven", ["all_fallback"])
     assert target["values"]["fallback_totals"][reason] == _LAYER_CALLS * (steps - switch)
     assert target["values"]["approximate"] == {"approx_quantized": 0, "approx_sparse": 0, "approx_calls": 0}
     assert target["values"]["steps_all_fallback"] == list(range(switch, steps))
-    assert result["items"]["R7_switch"]["reasons"] == ["target_kind_not_observed_at_switch"]
+    assert result["items"]["profile_switch"]["reasons"] == ["target_kind_not_observed_at_switch"]
     assert result["status"] == "not_success"
     assert "SUCCESS" not in _summary(result)
 
@@ -1289,14 +1289,14 @@ def test_partial_fallback_is_reported(make_sessions):
     steps, switch = 8, 3
     sessions, directory = make_sessions("C1", steps=steps, switch=switch)
     for step in _steps(sessions, _CA)[switch + 1 :]:
-        _make_fallback(step, "short_kv")
+        _make_fallback(step, "sage_not_applied")
 
     result = _evaluate(sessions, directory)
 
-    target = result["items"]["R10_target"]
+    target = result["items"]["kernel_target"]
     assert target["status"] == "pass"
     assert target["values"]["target_calls"] == _LAYER_CALLS
-    assert target["values"]["fallback_totals"]["short_kv"] == _LAYER_CALLS * (steps - switch - 1)
+    assert target["values"]["fallback_totals"]["sage_not_applied"] == _LAYER_CALLS * (steps - switch - 1)
     assert target["values"]["steps_all_fallback"] == list(range(switch + 1, steps))
     assert result["status"] == "success", _not_passing(result)
     assert result["report"]["backend"]["steps_all_fallback"] == list(range(switch + 1, steps))
@@ -1324,7 +1324,7 @@ def test_target_kernel_must_be_real(make_sessions, pointer, value, reason):
 
     result = _evaluate(sessions, directory)
 
-    target = result["items"]["R10_target"]
+    target = result["items"]["kernel_target"]
     assert (target["status"], target["reasons"]) == ("not_proven", [reason])
     assert result["status"] == "not_success"
     assert "SUCCESS" not in _summary(result)
@@ -1403,7 +1403,7 @@ def test_all_eager_is_compile_failure(make_sessions, change, status, reason):
 
     result = _evaluate(sessions, directory)
 
-    compiled = result["items"]["R10_compiled"]
+    compiled = result["items"]["compiled_graphs"]
     assert compiled["status"] == status
     assert reason in compiled["reasons"]
     assert result["status"] == "not_success"
@@ -1414,7 +1414,7 @@ def test_compile_rule_names_the_eager_step(make_sessions):
     sessions, directory = make_sessions("C1")
     _one_eager_block_call(sessions["scheduled"])
 
-    compiled = _evaluate(sessions, directory)["items"]["R10_compiled"]
+    compiled = _evaluate(sessions, directory)["items"]["compiled_graphs"]
 
     assert compiled["reasons"] == ["eager_block_calls"]
     assert compiled["values"] == {"steps": [{"request": "candidate", "sequence": 0, "step": 4}]}
@@ -1434,7 +1434,7 @@ def test_compile_rule_accepts_a_missing_read_back(make_sessions, pointer, value)
 
     result = _evaluate(sessions, directory)
 
-    compiled = result["items"]["R10_compiled"]
+    compiled = result["items"]["compiled_graphs"]
     assert compiled["status"] == "pass"
     # The counts are the proof. The read-back is not listed as evidence when it does not decide.
     assert not any("/startup/effective" in reference for reference in compiled["evidence"])
@@ -1445,7 +1445,7 @@ def test_compile_rule_lists_the_read_back_that_says_eager(make_sessions):
     sessions, directory = make_sessions("C1")
     sessions["scheduled"]["startup"]["effective"]["enforce_eager"] = True
 
-    compiled = _evaluate(sessions, directory)["items"]["R10_compiled"]
+    compiled = _evaluate(sessions, directory)["items"]["compiled_graphs"]
 
     assert (compiled["status"], compiled["reasons"]) == ("fail", ["enforce_eager"])
     assert "scheduled.json#/startup/effective/enforce_eager" in compiled["evidence"]
@@ -1497,7 +1497,7 @@ def test_output_problems_block_success(make_sessions, pointer, value, status, re
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["R8_lpips"]
+    item = result["items"]["lpips"]
     assert (item["status"], item["reasons"]) == (status, [reason])
     assert result["status"] == "not_success"
     assert "SUCCESS" not in _summary(result)
@@ -1530,7 +1530,7 @@ def test_reference_condition_mismatch_blocks_success(make_sessions, pointer, val
 
     conditions = result["items"]["conditions"]
     assert (conditions["status"], conditions["reasons"]) == ("fail", [reason])
-    for name in ("R7_switch", "R9_dense_prefix", "R8_lpips", "R8_video"):
+    for name in ("profile_switch", "dense_prefix", "lpips", "video"):
         item = result["items"][name]
         assert item["status"] == "not_proven", name
         assert "depends:conditions" in item["reasons"], name
@@ -1582,7 +1582,7 @@ def test_reference_not_repeatable_gates_prefix(make_sessions, pointer, value, va
     repeatable = result["items"]["dense_repeatable"]
     assert (repeatable["status"], repeatable["reasons"]) == ("fail", ["reference_not_repeatable"])
     assert repeatable["values"] == values
-    prefix = result["items"]["R9_dense_prefix"]
+    prefix = result["items"]["dense_prefix"]
     assert (prefix["status"], prefix["reasons"]) == ("not_proven", ["depends:dense_repeatable"])
     assert result["status"] == "not_success"
 
@@ -1597,7 +1597,7 @@ def test_empty_step_digests_are_not_proof_of_a_repeatable_reference(make_session
 
     repeatable = result["items"]["dense_repeatable"]
     assert (repeatable["status"], repeatable["reasons"]) == ("not_proven", ["digests_not_captured"])
-    prefix = result["items"]["R9_dense_prefix"]
+    prefix = result["items"]["dense_prefix"]
     assert (prefix["status"], prefix["reasons"]) == ("not_proven", ["depends:dense_repeatable"])
     assert result["status"] == "not_success"
 
@@ -1620,11 +1620,11 @@ def test_empty_step_digests_before_the_switch_are_not_proof_of_the_prefix(make_s
 
     result = _evaluate(sessions, directory)
 
-    for name in ("R7_switch", "R9_dense_prefix"):
+    for name in ("profile_switch", "dense_prefix"):
         item = result["items"][name]
         assert (item["status"], item["reasons"]) == ("not_proven", ["digests_not_captured"]), name
     # The steps that were captured still show where the candidate leaves the reference.
-    assert result["items"]["R7_switch"]["values"]["first_differing_step"] == switch
+    assert result["items"]["profile_switch"]["values"]["first_differing_step"] == switch
     assert result["status"] == "not_success"
 
 
@@ -1642,7 +1642,7 @@ def test_dense_prefix_rule_for_wan(make_sessions, step_offset, name, status):
     step = switch + step_offset
     _put(sessions["scheduled"], f"/requests/{_CA}/sequences/0/steps/{step}/digests/{name}", _digest("changed"))
 
-    prefix = _evaluate(sessions, directory)["items"]["R9_dense_prefix"]
+    prefix = _evaluate(sessions, directory)["items"]["dense_prefix"]
 
     assert prefix["status"] == status
     assert prefix["reasons"] == ([] if status == "pass" else ["prefix_differs"])
@@ -1679,7 +1679,7 @@ def test_no_schedule_regression_applies_the_stated_tolerance(make_sessions, tole
     _drift_plain_output(sessions)
     sessions["plain"]["config"]["no_schedule_tolerance"] = tolerance
 
-    item = _evaluate(sessions, directory)["items"]["R9_no_schedule"]
+    item = _evaluate(sessions, directory)["items"]["no_schedule"]
 
     assert (item["status"], item["reasons"]) == (status, reasons)
     assert item["values"] == {
@@ -1697,7 +1697,7 @@ def test_no_schedule_tolerance_needs_a_measured_difference(make_sessions):
     sessions["plain"]["config"]["no_schedule_tolerance"] = {"max_abs_diff_uint8": 3}
     sessions["plain"]["comparison_to_prior"] = None
 
-    item = _evaluate(sessions, directory)["items"]["R9_no_schedule"]
+    item = _evaluate(sessions, directory)["items"]["no_schedule"]
 
     assert (item["status"], item["reasons"]) == ("fail", ["output_changed"])
 
@@ -1719,7 +1719,7 @@ def test_no_schedule_tolerance_needs_the_same_prior_record(make_sessions, key, v
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["R9_no_schedule"]
+    item = result["items"]["no_schedule"]
     assert (item["status"], item["reasons"]) == ("not_proven", ["prior_record_differs"])
     assert item["values"]["max_abs_diff_uint8"] == 3
     assert result["status"] == "not_success"
@@ -1801,7 +1801,7 @@ def test_no_schedule_regression(make_sessions, edits, status, reasons):
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["R9_no_schedule"]
+    item = result["items"]["no_schedule"]
     assert (item["status"], item["reasons"]) == (status, reasons)
     assert item["values"] == ({"bit_identical": True} if status == "pass" else {})
     assert (result["status"] == "success") == (status == "pass")
@@ -1814,15 +1814,15 @@ def test_no_schedule_regression_is_not_measured_without_both_sessions(make_sessi
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["R9_no_schedule"]
+    item = result["items"]["no_schedule"]
     assert (item["status"], item["reasons"]) == ("not_measured", ["plain_or_prechange_session_absent"])
     assert result["status"] == "not_success"
 
 
-def test_ae5_boundary_passes_when_the_shifted_schedule_adds_no_graph(make_sessions):
+def test_shifted_boundary_passes_when_the_shifted_schedule_adds_no_graph(make_sessions):
     sessions, directory = make_sessions("C1", switch=3)
 
-    item = _evaluate(sessions, directory)["items"]["AE5_boundary"]
+    item = _evaluate(sessions, directory)["items"]["shifted_boundary"]
 
     assert (item["status"], item["reasons"]) == ("pass", [])
     assert item["values"] == {"first_switch": 4, "candidate_first_switch": 3, "delta": 0}
@@ -1868,23 +1868,23 @@ def test_ae5_boundary_passes_when_the_shifted_schedule_adds_no_graph(make_sessio
         ),
     ],
 )
-def test_ae5_boundary(make_sessions, pointer, value, status, reasons):
+def test_shifted_boundary(make_sessions, pointer, value, status, reasons):
     sessions, directory = make_sessions("C1", switch=3)
     _put(sessions["scheduled"], pointer, value)
 
     result = _evaluate(sessions, directory)
 
-    item = result["items"]["AE5_boundary"]
+    item = result["items"]["shifted_boundary"]
     assert (item["status"], item["reasons"]) == (status, reasons)
     # The shifted-boundary check is decided per matrix, so one combination still succeeds without it.
     assert result["status"] == "success", _not_passing(result)
 
 
-def test_ae5_boundary_reports_the_added_graphs_and_the_wrong_steps(make_sessions):
+def test_shifted_boundary_reports_the_added_graphs_and_the_wrong_steps(make_sessions):
     sessions, directory = make_sessions("C1", switch=3)
     _rebuild(sessions, directory, _BS, select_from=3, diverge_from=3, compiled=(5, 7))
 
-    item = _evaluate(sessions, directory)["items"]["AE5_boundary"]
+    item = _evaluate(sessions, directory)["items"]["shifted_boundary"]
 
     assert (item["status"], item["reasons"]) == ("fail", ["graphs_grew", "selection_mismatch"])
     assert item["values"]["delta"] == 2
@@ -1897,7 +1897,7 @@ def test_timing_report_holds_raw_samples_and_medians(make_sessions):
 
     result = _evaluate(sessions, directory)
 
-    assert result["items"]["R8_timing"]["status"] == "pass"
+    assert result["items"]["timing"]["status"] == "pass"
     timing = result["report"]["seconds_per_step"]
     assert timing["cold_start_seconds"] == 30.0
     assert timing["compile_warmup"] == [0.5] + [0.25] * (steps - 2) + [0.5]
@@ -1938,7 +1938,7 @@ def test_timing_requires_recorded_steady_phases(make_sessions, pointer, value, r
 
     result = _evaluate(sessions, directory)
 
-    timing = result["items"]["R8_timing"]
+    timing = result["items"]["timing"]
     assert (timing["status"], timing["reasons"]) == ("not_proven", [reason])
     assert result["report"]["seconds_per_step"] == {}
     assert result["status"] == "not_success"
@@ -1966,7 +1966,7 @@ def test_warmup_must_run_what_the_measured_requests_run(make_sessions, warmup, g
 
     # run_session stops after the warm-up request on the same gaps the verdict reports.
     assert bench._warmup_coverage_gaps(scheduled["requests"][_WU], later, steps) == gaps
-    timing = result["items"]["R8_timing"]
+    timing = result["items"]["timing"]
     if gaps:
         assert (timing["status"], timing["reasons"]) == ("not_proven", ["warmup_coverage"])
         assert result["status"] == "not_success"
@@ -1991,20 +1991,20 @@ def test_warmup_coverage_is_counted_per_transformer(make_sessions):
 
 def test_video_rule_checks_the_artifact_files(make_sessions):
     sessions, directory = make_sessions("C1")
-    assert _evaluate(sessions, directory)["items"]["R8_video"]["status"] == "pass"
+    assert _evaluate(sessions, directory)["items"]["video"]["status"] == "pass"
 
-    without_directory = bench.evaluate_combination(sessions)["items"]["R8_video"]
+    without_directory = bench.evaluate_combination(sessions)["items"]["video"]
     assert (without_directory["status"], without_directory["reasons"]) == ("not_proven", ["artifact_missing"])
 
     (directory / "scheduled-candidate.mp4").write_bytes(b"replaced after the run")
-    changed = _evaluate(sessions, directory)["items"]["R8_video"]
+    changed = _evaluate(sessions, directory)["items"]["video"]
     assert (changed["status"], changed["reasons"]) == ("fail", ["artifact_changed"])
 
     (directory / "scheduled-side_by_side.mp4").unlink()
-    missing = _evaluate(sessions, directory)["items"]["R8_video"]
+    missing = _evaluate(sessions, directory)["items"]["video"]
     assert (missing["status"], missing["reasons"]) == ("fail", ["artifact_changed"])
     (directory / "scheduled-candidate.mp4").unlink()
-    missing = _evaluate(sessions, directory)["items"]["R8_video"]
+    missing = _evaluate(sessions, directory)["items"]["video"]
     assert (missing["status"], missing["reasons"]) == ("not_proven", ["artifact_missing"])
 
 
@@ -2022,7 +2022,7 @@ def test_video_rule_checks_the_side_by_side_entry(make_sessions, pointer, value,
 
     result = _evaluate(sessions, directory)
 
-    video = result["items"]["R8_video"]
+    video = result["items"]["video"]
     assert (video["status"], video["reasons"]) == (status, [reason])
     assert result["status"] == "not_success"
 
@@ -2040,7 +2040,7 @@ def test_backend_report_must_be_complete(make_sessions, pointer, value):
 
     result = _evaluate(sessions, directory)
 
-    report = result["items"]["R8_backend_report"]
+    report = result["items"]["backend_report"]
     assert (report["status"], report["reasons"]) == ("not_proven", ["backend_report_incomplete"])
     assert result["report"]["backend"] == {}
     assert result["status"] == "not_success"
@@ -2145,7 +2145,7 @@ def test_missing_scheduled_session_is_not_measured(make_sessions):
     for name in bench.ITEM_DEPENDENCIES:
         item = result["items"][name]
         assert (item["status"], item["reasons"]) == ("not_measured", ["scheduled_session_absent"]), name
-    assert result["items"]["R9_no_schedule"]["status"] == "pass"
+    assert result["items"]["no_schedule"]["status"] == "pass"
 
 
 @pytest.mark.parametrize("scheduled", [{}, [], {"requests": "x"}, {"schema": bench.SCHEMA, "config": 3}])
@@ -2176,7 +2176,7 @@ def test_matrix_requires_all_six(make_sessions):
     summary = bench.render_summary(results, matrix)
 
     assert (matrix["status"], matrix["missing"]) == ("not_success", ["C4"])
-    assert summary.splitlines()[0] == "R7-R10: NOT PROVEN"
+    assert summary.splitlines()[0] == "Acceptance: NOT PROVEN"
     assert "C4: not_measured (no session records)" in summary
     assert "SUCCESS" not in summary
 
@@ -2192,8 +2192,8 @@ def test_matrix_rejects_one_unproven_combination(make_sessions):
     summary = bench.render_summary(results, matrix)
 
     assert (matrix["status"], matrix["missing"]) == ("not_success", [])
-    assert summary.splitlines()[0] == "R7-R10: NOT PROVEN"
-    assert "  R10_target: not_proven [all_fallback]" in summary.splitlines()
+    assert summary.splitlines()[0] == "Acceptance: NOT PROVEN"
+    assert "  kernel_target: not_proven [all_fallback]" in summary.splitlines()
     # The summary names reasons. The evidence pointers are in the verdict file.
     assert "scheduled.json#" not in summary
     assert "SUCCESS" not in summary
@@ -2213,9 +2213,9 @@ def test_matrix_requires_one_shifted_boundary_pass(make_sessions):
     assert matrix == {
         "status": "not_success",
         "missing": [],
-        "ae5": {"status": "not_measured", "combinations": [], "failed": []},
+        "shifted_boundary": {"status": "not_measured", "combinations": [], "failed": []},
     }
-    assert summary.splitlines()[1] == "AE5 shifted boundary: not_measured; passed on none; failed on none"
+    assert summary.splitlines()[1] == "Shifted boundary: not_measured; passed on none; failed on none"
     assert "SUCCESS" not in summary
 
 
@@ -2236,13 +2236,13 @@ def test_matrix_rejects_one_failed_shifted_boundary(make_sessions):
     assert matrix == {
         "status": "not_success",
         "missing": [],
-        "ae5": {"status": "fail", "combinations": passed, "failed": ["C5"]},
+        "shifted_boundary": {"status": "fail", "combinations": passed, "failed": ["C5"]},
     }
     assert summary.splitlines()[:2] == [
-        "R7-R10: NOT PROVEN",
-        f"AE5 shifted boundary: fail; passed on {', '.join(passed)}; failed on C5",
+        "Acceptance: NOT PROVEN",
+        f"Shifted boundary: fail; passed on {', '.join(passed)}; failed on C5",
     ]
-    assert "  AE5_boundary: fail [graphs_grew]" in summary.splitlines()
+    assert "  shifted_boundary: fail [graphs_grew]" in summary.splitlines()
     assert "SUCCESS" not in summary
 
 
@@ -2432,8 +2432,13 @@ _FLAGS_OFF = {"quant": False, "skip_enabled": False, "skip_configured": False}
             {"approx_quantized": 1, "approx_sparse": 1, "approx_calls": 1},
             id="sage-and-skip",
         ),
+        # Quantization is enabled and the kernel call carries no SAGE scale factors. The current TRTLLM
+        # backend is not expected to produce this state; this row checks how the harness counts it.
         pytest.param(
-            {"selection": "p", **_FLAGS_OFF, "quant": True}, [(None, False)], {"fallback.short_kv": 1}, id="short-kv"
+            {"selection": "p", **_FLAGS_OFF, "quant": True},
+            [(None, False)],
+            {"fallback.sage_not_applied": 1},
+            id="sage-not-applied",
         ),
         pytest.param(
             {"selection": "p", **_FLAGS_OFF, "skip_configured": True},
@@ -3611,7 +3616,7 @@ def test_run_session_with_fake_omni(fake_service, capsys):
     result = bench.evaluate_combination(sessions, directory=out_dir)
     assert len(inputs) == 3
     assert result["status"] == "success", _not_passing(result)
-    assert result["items"]["AE5_boundary"]["status"] == "pass"
+    assert result["items"]["shifted_boundary"]["status"] == "pass"
     assert result["report"]["reference_vs_plain"] == {"bit_identical": True}
     assert result["report"]["seconds_per_step"]["candidate"]["samples"] == [1.0, 1.0, 1.0, 1.0]
 
@@ -3774,8 +3779,8 @@ def test_run_session_keeps_the_record_when_lpips_fails(fake_service):
     # Only the scheduled record is given, so the no-schedule item is not measured either.
     result = bench.evaluate_combination({"scheduled": record}, directory=fake_service.out_dir)
     assert _not_passing(result) == {
-        "R8_lpips": ("not_measured", ["lpips_failed"]),
-        "R9_no_schedule": ("not_measured", ["plain_or_prechange_session_absent"]),
+        "lpips": ("not_measured", ["lpips_failed"]),
+        "no_schedule": ("not_measured", ["plain_or_prechange_session_absent"]),
     }
 
 
@@ -3873,7 +3878,7 @@ def test_frame_problem_skips_lpips(fake_service):
 
     result = bench.evaluate_combination({"scheduled": record}, directory=fake_service.out_dir)
     assert result["items"]["conditions"]["reasons"] == ["output_shape_differs"]
-    assert result["items"]["R8_lpips"]["reasons"] == ["depends:conditions"]
+    assert result["items"]["lpips"]["reasons"] == ["depends:conditions"]
 
 
 def test_comparison_self_test(monkeypatch):
@@ -3971,7 +3976,7 @@ def test_verdict_cli(make_sessions, tmp_path, capsys):
 
     stdout = capsys.readouterr().out
     verdict = json.loads(out_file.read_text(encoding="utf-8"))
-    assert stdout.startswith("R7-R10: SUCCESS\n")
+    assert stdout.startswith("Acceptance: SUCCESS\n")
     assert verdict["summary_text"] == stdout
     assert (verdict["kind"], verdict["matrix"]["status"]) == ("verdict", "success")
     assert sorted(verdict["combinations"]) == list(bench.COMBINATIONS)
@@ -3981,15 +3986,15 @@ def test_verdict_cli(make_sessions, tmp_path, capsys):
 
     sessions, directory = make_sessions("C2")
     for step in _steps(sessions, _CA)[3:]:
-        _make_fallback(step, "short_kv")
+        _make_fallback(step, "private_gate")
     _write_sessions(directory, sessions)
     second_file = tmp_path / "verdict-2.json"
 
     assert bench.main(["verdict", "--out", str(second_file), *directories]) == 1
 
     stdout = capsys.readouterr().out
-    assert stdout.startswith("R7-R10: NOT PROVEN\n")
-    assert "  R10_target: not_proven [all_fallback]" in stdout
+    assert stdout.startswith("Acceptance: NOT PROVEN\n")
+    assert "  kernel_target: not_proven [all_fallback]" in stdout
     assert "SUCCESS" not in stdout
     assert json.loads(second_file.read_text(encoding="utf-8"))["matrix"]["status"] == "not_success"
 

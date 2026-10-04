@@ -2083,7 +2083,7 @@ class HunyuanImage3Pipeline(
             None,
         )
         # Check the request's schedule against the sequence built here, before prepare_latents and the
-        # AR-reuse prefill below (AE4). The runner has not opened the forward context yet.
+        # AR-reuse prefill below. The runner has not opened the forward context yet.
         require_request_attention_schedule_fits(state, self.od_config, len(timesteps))
         pipe._num_timesteps = len(timesteps)
         req_scheduler = copy.deepcopy(self.scheduler)
@@ -2373,7 +2373,7 @@ class HunyuanImage3Pipeline(
                 "HunyuanImage3 paged_scheduler currently supports request-level execution only; "
                 "disable step execution or use dense_legacy."
             )
-        # A bound schedule selects attention from each request's own step and total (KTD5), so requests
+        # A bound schedule selects attention from each request's own step and total, so requests
         # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
         scheduled = is_forward_context_available() and bool(get_forward_context().attention_schedule)
         if scheduled:

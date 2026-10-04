@@ -331,11 +331,12 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
 def begin_scheduled_denoise(total_steps: int) -> int | None:
     """Check the bound schedule against one actual denoise sequence; call before its first forward.
 
-    Returns ``total_steps`` when a non-empty schedule is bound and None otherwise. Publishers that did
-    not publish a total before U4 pass the result as their published total, so an unscheduled run
-    publishes exactly what it did before (R9): RAINFUSION's end_step gate, for example, reads the
-    total. Raises InvalidAttentionScheduleError when a range does not fit the sequence (AE4). Call it
-    once per sequence the pipeline runs (per output, window or clip when those restart at step 0).
+    Returns ``total_steps`` when a non-empty schedule is bound and None otherwise. A publisher with
+    no other reason to publish a total passes the result as its published total, so a run without a
+    schedule publishes no total. Publishing one there would change backends that read it: RAINFUSION
+    with end_step set, for example, runs dense while the total is None. Raises
+    InvalidAttentionScheduleError when a range does not fit the sequence. Call it once per sequence
+    the pipeline runs (per output, window or clip when those restart at step 0).
     """
     ctx = _forward_context
     schedule = getattr(ctx, "attention_schedule", None)
@@ -351,7 +352,7 @@ def begin_scheduled_denoise(total_steps: int) -> int | None:
 def request_denoise_progress(step_idx: int, total_steps: int, timestep: float | None = None):
     """Publish one request's progress around its own forward and restore the previous values on any exit.
 
-    For scheduled requests that share a denoise_step call but not their progress (KTD5): each request
+    For scheduled requests that share a denoise_step call but not their progress: each request
     is evaluated separately under its own step, total and timestep. Publishing goes through
     set_forward_context_denoise_step_idx, like a per-batch publish. Restoring assigns the saved fields
     directly, so a restore never calls the paged runtime's ensure_active.

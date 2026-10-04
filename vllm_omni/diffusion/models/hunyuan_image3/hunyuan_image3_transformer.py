@@ -3237,7 +3237,7 @@ class HunyuanImage3Text2ImagePipeline(DiffusionPipeline):
             sigmas,
         )
         # Check a bound schedule against the sequence this call runs, before any forward below, including
-        # the AR-reuse prefill (AE4). None when no schedule is bound, which keeps the step-only publish.
+        # the AR-reuse prefill. None when no schedule is bound, which keeps the step-only publish.
         scheduled_total = begin_scheduled_denoise(len(timesteps))
 
         # Prepare latent variables

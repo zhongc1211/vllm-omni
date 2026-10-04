@@ -696,7 +696,7 @@ def test_runner_selects_wan_attention_by_actual_denoise_step(scheduled, monkeypa
         (2, total, last, "low", False),
     ]
     # A scheduled run clears the step after the loop, so VAE decode uses the baseline. An unscheduled
-    # run leaves the last step in place, as before.
+    # run leaves the last step in place.
     assert after_loop == [(None, None, "base") if scheduled else (2, None, "base")]
 
 

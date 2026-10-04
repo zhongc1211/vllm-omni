@@ -584,7 +584,7 @@ def test_distilled_step_supplies_guidance_and_meanflow_timestep(monkeypatch):
     torch.testing.assert_close(captured["timesteps_r"], torch.tensor([0.25]))
 
 
-# Attention schedule integration (U4). Step-mode tests evaluate A at step 2 of 8 and B at step 5 of 10.
+# Attention schedule integration. Step-mode tests evaluate A at step 2 of 8 and B at step 5 of 10.
 _STEP_SCHEDULE = (AttentionScheduleRange(start=3, end=6, profile="sparse"),)
 _REQUEST_SCHEDULE = (AttentionScheduleRange(start=1, end=3, profile="sparse"),)
 
@@ -710,7 +710,7 @@ def test_unscheduled_step_keeps_one_group_and_step_only_publish(monkeypatch, sch
     with _denoise_context(schedule):
         out = pipeline.denoise_step(InputBatch.make_batch(states))
 
-    # Mixed later steps share one forward and publish no step, as before schedules existed.
+    # Mixed later steps share one forward and publish no step.
     assert records == [(None, None, None, False, [1.0, 2.0])]
     torch.testing.assert_close(out, torch.tensor([[10.0], [20.0]]))
 

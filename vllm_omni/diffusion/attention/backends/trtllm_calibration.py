@@ -80,7 +80,7 @@ def propagate_skip_softmax_calibration(specs: list, model: str | None, tf_config
 
 
 def collect_calibration_specs(attention_config: Any, schedule: Any = None) -> list:
-    """Baseline specs plus every schedule profile's specs, in a stable order (KTD8).
+    """Baseline specs plus every schedule profile's specs, in a stable order.
 
     Both calibration discovery and the target-sparsity-without-calibration check have to see
     non-active profiles, otherwise a profile the service default never references keeps an

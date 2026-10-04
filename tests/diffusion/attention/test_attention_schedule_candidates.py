@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""CPU contracts for U2 slice-1 per-layer candidate preparation.
+"""CPU contracts for per-layer schedule candidate preparation and startup validation.
 
-These tests pin the candidate-preparation contract: with no schedule the baseline
-construction path is unchanged and no extra candidates exist; with a schedule each
+The first half pins the candidate-preparation contract: with no schedule no candidates
+are prepared and only the baseline implementation is built; with a schedule each
 layer pre-constructs one deduplicated _PreparedCandidate record per distinct effective
 profile, without replacing the baseline, reproducing the baseline construction-time
-guards (marked-paged promotion, AllGather+TRTLLM rejection). Calibration (KTD8, slice-2)
-and the post-load startup compatibility traversal (KTD6, slice-3) are later slices.
+guards (marked-paged promotion, AllGather+TRTLLM rejection). The second half covers the
+post-load startup compatibility traversal, validate_attention_schedule_candidates.
+Calibration stamping is tested in test_trtllm_calibration.py.
 
 No backend touches a GPU and no model weights load; backends and impls are fakes
 resolved from the supplied AttentionConfig, mirroring test_attention_config.py.
@@ -189,8 +190,8 @@ def test_schedule_prepares_one_candidate_record_per_profile(attention_env):
 
 
 def test_candidate_backend_identity_matches_profile(attention_env):
-    # TG1: assert each candidate carries the backend/spec its profile selects, so a
-    # wrong-backend candidate (the #1 class of bug) would be caught.
+    # Assert each candidate carries the backend/spec its profile selects, so a
+    # wrong-backend candidate would be caught.
     schedule = AttentionScheduleConfig(
         profiles={
             "quant": AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=7)),
@@ -239,7 +240,7 @@ def test_same_backend_different_params_are_distinct_candidates(attention_env):
 
 
 def test_explicit_and_default_profiles_with_same_backend_do_not_share(attention_env):
-    # #2: the dedup key must include backend_explicit, so an explicit profile and a
+    # The dedup key must include backend_explicit, so an explicit profile and a
     # platform-default profile that share a backend name do not collapse onto one impl.
     explicit = AttentionConfig(default=AttentionSpec(backend="PLATFORM_DEFAULT"))
     schedule = AttentionScheduleConfig(
@@ -257,7 +258,7 @@ def test_explicit_and_default_profiles_with_same_backend_do_not_share(attention_
 
 
 def test_profile_not_referenced_by_default_is_still_prepared(attention_env):
-    # KTD6: preparation covers ALL configured profiles, not only those the default references.
+    # Preparation covers ALL configured profiles, not only those the default references.
     schedule = AttentionScheduleConfig(
         profiles={
             "used": AttentionConfig(default=AttentionSpec(backend="SDPA")),
@@ -272,7 +273,7 @@ def test_profile_not_referenced_by_default_is_still_prepared(attention_env):
 
 
 def test_per_role_profile_candidate_resolves_role_spec(attention_env):
-    # TG3/KTD1: a per_role profile resolves the role-specific spec independently.
+    # A per_role profile resolves the role-specific spec independently.
     schedule = AttentionScheduleConfig(
         profiles={"roled": AttentionConfig(per_role={"self": AttentionSpec(backend="BLOCK_SPARSE")})},
         default=[{"start": 0, "end": None, "profile": "roled"}],
@@ -304,7 +305,7 @@ def test_impl_override_applies_to_candidate(attention_env):
 
 
 def test_custom_attention_with_schedule_is_rejected(attention_env):
-    # KTD6/TG2: a custom-attention layer cannot represent candidates; reject with the
+    # A custom-attention layer cannot represent candidates; reject with the
     # specific guard, not any ValueError/TypeError.
     schedule = AttentionScheduleConfig(
         profiles={"quant": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
@@ -321,7 +322,7 @@ def test_custom_attention_with_schedule_is_rejected(attention_env):
 
 
 def test_profile_resolution_error_propagates(attention_env):
-    # TG3: an unbuildable candidate must fail at construction, not be silently skipped.
+    # An unbuildable candidate must fail at construction, not be silently skipped.
     def _boom(*, role, head_size, attention_config=None, role_category=None, allow_trtllm_default=True):
         if attention_config is not None:
             spec, _ = attention_config.resolve_with_source(role=role, role_category=role_category)
@@ -345,7 +346,7 @@ def test_profile_resolution_error_propagates(attention_env):
 
 
 def test_scheduled_layer_registers_no_extra_submodules(attention_env):
-    # TG3: candidates live in a plain dict; AttentionImpl is not an nn.Module, so a
+    # Candidates live in a plain dict; AttentionImpl is not an nn.Module, so a
     # scheduled layer registers no submodule and its state_dict matches the baseline.
     schedule = AttentionScheduleConfig(
         profiles={"quant": AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=7))},
@@ -359,7 +360,7 @@ def test_scheduled_layer_registers_no_extra_submodules(attention_env):
 
 
 def test_paged_candidate_is_promoted_to_flash_attn(attention_env):
-    # #1: a marked-paged layer whose profile falls back to the platform default must
+    # A marked-paged layer whose profile falls back to the platform default must
     # promote the candidate to a paged-capable backend, exactly like the baseline.
     attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
     schedule = AttentionScheduleConfig(
@@ -375,7 +376,7 @@ def test_paged_candidate_is_promoted_to_flash_attn(attention_env):
 
 
 def test_allgather_trtllm_candidate_is_rejected(attention_env):
-    # #1: a candidate selecting TRTLLM_ATTN under AllGather-KV SP must be rejected at
+    # A candidate selecting TRTLLM_ATTN under AllGather-KV SP must be rejected at
     # construction, reproducing the baseline guard.
     schedule = AttentionScheduleConfig(
         profiles={"trt": AttentionConfig(default=AttentionSpec(backend="TRTLLM_ATTN"))},
@@ -386,14 +387,15 @@ def test_allgather_trtllm_candidate_is_rejected(attention_env):
         attention_env.build(config)
 
 
-# --- U2 slice-3: KTD6 post-load startup compatibility traversal -------------
+# --- Post-load startup compatibility traversal ------------------------------
 #
-# Construction (slice-1) reproduces the guards that decide WHICH backend a layer uses.
+# Construction reproduces the guards that decide WHICH backend a layer uses.
 # The remaining per-candidate guarantees need the loaded model and the resolved parallel
 # plan, so they are checked once after load, before serving: paged-KV representability,
 # KV-cache-quantization support, SP auto-pad mask capability and calibration presence.
-# Each of these currently keys off the baseline only, which would surface as a failure
-# inside the first kernel after U3 switches to a candidate.
+# The checks that run without this traversal do not read each prepared candidate, so an
+# incompatible candidate would fail inside the first kernel after the layer switches to it,
+# or run dense when its calibration curve is missing.
 
 
 def _pipeline(layer, *, sp_plan=None, name="attn1"):
@@ -417,9 +419,9 @@ def _flat_auto_pad_plan():
 def _auto_pad_plan(*, auto_pad=True, nested_list=False):
     """A plan shaped the way real models declare it: module id -> param/output key -> input spec.
 
-    ``SequenceParallelInputType`` is itself a dict (sp_plan.py:349), so auto_pad lives two levels
-    below the plan root; wan2_2_transformer.py:850-858 is the in-tree example. ``nested_list``
-    wraps the spec in a list, which the type alias also allows.
+    ``SequenceParallelInputType`` (vllm_omni/diffusion/distributed/sp_plan.py) is itself a dict, so
+    auto_pad lives two levels below the plan root; ``WanTransformer3DModel._sp_plan`` is the in-tree
+    example. ``nested_list`` wraps the spec in a list, which the type alias also allows.
     """
     spec = SequenceParallelInput(split_dim=1, expected_dims=3, auto_pad=auto_pad)
     return {"rope": {0: [spec] if nested_list else spec}}
@@ -448,7 +450,7 @@ def test_startup_validation_accepts_compatible_candidates(attention_env):
 
 
 def test_startup_validation_rejects_layer_missing_a_prepared_profile(attention_env):
-    # KTD6: validation covers ALL configured profiles, so a layer that lost one is a defect.
+    # Validation covers ALL configured profiles, so a layer that lost one is a defect.
     schedule = AttentionScheduleConfig(
         profiles={
             "a": AttentionConfig(default=AttentionSpec(backend="SDPA")),
@@ -518,7 +520,7 @@ def test_startup_validation_rejects_candidate_matching_an_explicit_non_paged_bas
 
 def test_startup_validation_rejects_paged_capable_candidate_that_differs_from_baseline(attention_env):
     # forward_paged runs the native implementation bound to the baseline and never reads the
-    # candidate's spec, so even a paged-capable candidate would be silently ignored (KTD6).
+    # candidate's spec, so even a paged-capable candidate would be silently ignored.
     attention_env.monkeypatch.setattr(FlashAttentionBackend, "get_impl_cls", staticmethod(lambda: _FakeImpl))
     attention_env.monkeypatch.setattr(_fake_backend("BLOCK_SPARSE"), "supports_paged_kv", True)
     schedule = AttentionScheduleConfig(
@@ -576,8 +578,8 @@ def test_startup_validation_accepts_candidate_supporting_kv_cache_dtype(attentio
 
 
 def test_startup_validation_rejects_auto_pad_incompatible_candidate(attention_env):
-    # SP auto-pad needs attention_mask. The pad-time probe sees the baseline only today, so a
-    # candidate without mask support would fail in the first padded kernel.
+    # SP auto-pad needs attention_mask. The pad-time probe reads the config for role "self" only,
+    # so the traversal checks every prepared candidate on a layer whose component plans auto_pad.
     schedule = AttentionScheduleConfig(
         profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
         default=[{"start": 0, "end": None, "profile": "nomask"}],
@@ -594,7 +596,7 @@ def test_startup_validation_rejects_auto_pad_incompatible_candidate(attention_en
 
 def test_startup_validation_skips_mask_check_without_auto_pad_or_sp(attention_env):
     # Same layer and profile, but no auto_pad plan and SP=1: mask capability is not required,
-    # so a mask-free candidate stays legal (this is today's accepted behaviour).
+    # so a mask-free candidate stays legal.
     schedule = AttentionScheduleConfig(
         profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
         default=[{"start": 0, "end": None, "profile": "nomask"}],
@@ -609,7 +611,7 @@ def test_startup_validation_skips_mask_check_without_auto_pad_or_sp(attention_en
 
 
 def test_startup_validation_rejects_candidate_without_resolvable_calibration(attention_env):
-    # KTD8: target_sparsity needs a calibrated curve for THIS layer's expert. A curve that only
+    # target_sparsity needs a calibrated curve for THIS layer's expert. A curve that only
     # exists for another expert would silently leave the candidate dense.
     schedule = AttentionScheduleConfig(
         profiles={
@@ -669,12 +671,12 @@ def test_startup_validation_accepts_candidate_with_resolvable_calibration(attent
     assert layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config) == 1
 
 
-# --- P1 fixes from the consolidated four-party review --------------------------
+# --- Startup validation: nested SP plans, KV-cache dtype "float", ring attention, explicit threshold ---
 
 
 def test_startup_validation_detects_auto_pad_nested_in_module_plan(attention_env):
-    # Review finding #1: real plans nest the spec under a module id and a parameter key, so a
-    # walker that only unwraps list/tuple never sees auto_pad and the mask check is dead code.
+    # Real plans nest the spec under a module id and a parameter key, so a walker that only
+    # unwraps list/tuple would never see auto_pad and the mask check would never run.
     schedule = AttentionScheduleConfig(
         profiles={"nomask": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
         default=[{"start": 0, "end": None, "profile": "nomask"}],
@@ -724,8 +726,8 @@ def test_startup_validation_ignores_nested_plan_without_auto_pad(attention_env):
 
 
 def test_startup_validation_accepts_kv_cache_dtype_float(attention_env):
-    # Review finding #3: the baseline guard exempts "float" (layer.py:508), so the traversal must
-    # too; otherwise a config that loads today is rejected as soon as a schedule exists.
+    # The baseline guard (Attention._init_kv_cache_quantization) exempts "float", so the traversal
+    # must too; otherwise a config that loads without a schedule is rejected once a schedule is set.
     schedule = AttentionScheduleConfig(
         profiles={"quant": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
         default=[{"start": 0, "end": None, "profile": "quant"}],
@@ -747,8 +749,8 @@ def _ring_config(schedule, **kwargs):
 
 
 def test_startup_validation_rejects_skip_softmax_candidate_under_ring(attention_env):
-    # Review finding #4: _run_ring_attention rejects skip-softmax by reading the BASELINE impl, so a
-    # candidate carrying it would be silently ignored after U3 switches. KTD6 wants that at startup.
+    # _run_ring_attention rejects skip-softmax by reading the BASELINE impl, so a candidate carrying
+    # it would be silently ignored after the layer switches to it. It must be rejected at startup.
     schedule = AttentionScheduleConfig(
         profiles={
             "sparse": AttentionConfig(
@@ -764,9 +766,9 @@ def test_startup_validation_rejects_skip_softmax_candidate_under_ring(attention_
 
 
 def test_startup_validation_rejects_candidate_backend_divergence_under_ring(attention_env):
-    # The ring runner is constructed once from the baseline's backend preference (layer.py:308-317)
-    # and ring.py:205-226 refuses explicit selections it cannot honor, so a candidate that resolves
-    # to a different backend cannot be represented under ring.
+    # The ring runner is constructed once from the baseline's backend preference (Attention.__init__)
+    # and RingParallelAttention.run_attention refuses explicit selections it cannot honor, so a
+    # candidate that resolves to a different backend cannot be represented under ring.
     schedule = AttentionScheduleConfig(
         profiles={"other": AttentionConfig(default=AttentionSpec(backend="BLOCK_SPARSE"))},
         default=[{"start": 0, "end": None, "profile": "other"}],
@@ -792,8 +794,8 @@ def test_startup_validation_accepts_ring_candidate_matching_baseline(attention_e
 
 
 def test_startup_validation_accepts_explicit_threshold_without_calibration(attention_env):
-    # KTD8 / plan U2 scenario: an explicit threshold is the calibration-free path, so it must not
-    # require a curve. The traversal returns early for it; this pins that behaviour.
+    # An explicit threshold is the calibration-free path, so it must not require a curve. The
+    # traversal returns early for it; this pins that behaviour.
     schedule = AttentionScheduleConfig(
         profiles={
             "thresh": AttentionConfig(
@@ -809,14 +811,19 @@ def test_startup_validation_accepts_explicit_threshold_without_calibration(atten
     assert layer_mod.validate_attention_schedule_candidates(_pipeline(layer), config) == 1
 
 
-# --- P2 fixes from the consolidated four-party review --------------------------
+# --- Startup validation: per-component SP plans, layers without candidates, per-candidate calibration ---
+#
+# This section also covers a model with no attention layer, the candidate dedup key (calibration,
+# impl class, unserializable kwargs), what the ring rule compares (resolved backend name, explicit
+# flag, backend kwargs) and the layers that the ring and KV-cache-quantization rules skip.
 
 
 def _two_component_pipeline(scheduled_layer, other_layer, *, pad_first=True, pad_second=False):
     """A pipeline with two DiT components, each with its own SP plan, like a real two-expert model.
 
-    The registry applies SP hooks per component (registry.py:589/616), so an auto_pad declaration
-    on one component must not impose mask support on the other component's layers.
+    The registry applies SP hooks per component (_apply_sequence_parallel_if_enabled in
+    vllm_omni/diffusion/registry.py), so an auto_pad declaration on one component must not impose
+    mask support on the other component's layers.
     """
     import torch.nn as nn
 
@@ -842,7 +849,7 @@ def _mask_free_profile(name="nomask"):
 
 
 def test_startup_validation_scopes_auto_pad_to_the_owning_component(attention_env):
-    # Review finding #2: auto_pad is declared per DiT component, so requiring mask support from a
+    # auto_pad is declared per DiT component, so requiring mask support from a
     # component that never pads would reject configurations that run fine.
     attention_env.monkeypatch.setattr(
         _fake_backend("BLOCK_SPARSE"), "supports_attention_mask", staticmethod(lambda spec=None: False)
@@ -875,7 +882,7 @@ def test_startup_validation_accepts_mask_free_candidate_in_unpadded_component(at
 
 
 def test_startup_validation_rejects_model_without_attention_layers(attention_env):
-    # Review finding #9: a schedule that validated nothing must not pass silently.
+    # A schedule that validated nothing must not pass silently.
     import torch.nn as nn
 
     schedule = _mask_free_profile()
@@ -888,7 +895,7 @@ def test_startup_validation_rejects_model_without_attention_layers(attention_env
 
 
 def test_startup_validation_ignores_layer_built_without_schedule_config(attention_env):
-    # Review finding #7: Attention can be constructed with no current diffusion config; such a layer
+    # Attention can be constructed with no current diffusion config; such a layer
     # legitimately has no candidates and must not be reported as a missing profile.
     schedule = _mask_free_profile()
     aware = attention_env.build(_make_config(schedule=schedule))
@@ -899,8 +906,8 @@ def test_startup_validation_ignores_layer_built_without_schedule_config(attentio
 
 
 def test_profiles_differing_only_in_calibration_do_not_share(attention_env):
-    # Review finding #5: the dedup key carried only a boolean, so two profiles with identical
-    # backend kwargs but different curves collapsed onto one impl and one curve won.
+    # The dedup key includes the spec's skip_calibration, so two profiles with identical backend
+    # kwargs but different curves do not collapse onto one impl that holds only one of the curves.
     schedule = AttentionScheduleConfig(
         profiles={
             "curve_a": AttentionConfig(
@@ -927,7 +934,7 @@ def test_profiles_differing_only_in_calibration_do_not_share(attention_env):
 
 
 def test_identical_profiles_still_share_after_calibration_keying(attention_env):
-    # The #5 fix must not break dedup for profiles that really are identical.
+    # Keying on skip_calibration must not break dedup for profiles that really are identical.
     spec = dict(
         backend="TRTLLM_ATTN",
         skip_softmax=SkipSoftmaxSpec(threshold=0.2),
@@ -946,9 +953,10 @@ def test_identical_profiles_still_share_after_calibration_keying(attention_env):
 
 
 def test_startup_validation_uses_the_calibration_stamping_would_use(attention_env):
-    # Review finding #6: stamping applies the FIRST spec's dict pipeline-wide, so validation must
-    # answer against that same dict. Here the first profile's dict has no curve for this layer's
-    # expert, so every candidate stays dense even though a later profile's own dict would resolve.
+    # Validation resolves the curve from the dict that stamping writes onto the candidate, which is
+    # the candidate's own skip_calibration when it has one. Here the first profile's own dict has no
+    # curve for this layer's expert, so that profile is rejected although the second profile's dict
+    # would resolve one.
     schedule = AttentionScheduleConfig(
         profiles={
             "a_first": AttentionConfig(
@@ -976,8 +984,8 @@ def test_startup_validation_uses_the_calibration_stamping_would_use(attention_en
 
 
 def test_startup_validation_accepts_when_effective_calibration_ignores_the_layer(attention_env):
-    # The same first-wins rule in the other direction: the effective dict ignores this layer, so
-    # staying dense is legitimate for every candidate even though a later profile has a curve.
+    # The accepted counterpart: the first profile's own dict ignores this layer, so staying dense is
+    # legitimate for that candidate, and the second profile resolves a curve from its own dict.
     schedule = AttentionScheduleConfig(
         profiles={
             "a_first": AttentionConfig(
@@ -1004,9 +1012,9 @@ def test_startup_validation_accepts_when_effective_calibration_ignores_the_layer
 
 
 def test_startup_validation_rejects_later_profile_whose_own_curve_misses_the_layer(attention_env):
-    # Second-review finding #1: stamping must use the candidate's own skip_calibration. The first
-    # profile covers this layer, but the later profile's own dict does not, so that later profile
-    # must be rejected. Accepting it would lock in the shared-stamp bug.
+    # Stamping uses the candidate's own skip_calibration. The first profile's dict covers this layer,
+    # but the later profile's own dict does not, so that later profile must be rejected. It would
+    # resolve a curve only if the first profile's dict were stamped onto every candidate.
     schedule = AttentionScheduleConfig(
         profiles={
             "a_first": AttentionConfig(
@@ -1034,7 +1042,7 @@ def test_startup_validation_rejects_later_profile_whose_own_curve_misses_the_lay
 
 
 def test_startup_validation_skips_ring_rules_when_layer_skips_sequence_parallel(attention_env):
-    # Second-review finding #2: a layer with skip_sequence_parallel never enters the ring runner.
+    # A layer with skip_sequence_parallel never enters the ring runner.
     schedule = AttentionScheduleConfig(
         profiles={
             "sparse": AttentionConfig(
@@ -1050,7 +1058,7 @@ def test_startup_validation_skips_ring_rules_when_layer_skips_sequence_parallel(
 
 
 def test_startup_validation_accepts_lowercase_backend_that_resolves_like_baseline(attention_env):
-    # Second-review finding #5: compare resolved backend names, not the raw preference string.
+    # The traversal compares resolved backend names, not the raw preference string.
     # The baseline is explicit too, so only the spelling differs.
     baseline = AttentionConfig(default=AttentionSpec(backend="PLATFORM_DEFAULT"))
     schedule = AttentionScheduleConfig(
@@ -1068,7 +1076,7 @@ def test_startup_validation_accepts_lowercase_backend_that_resolves_like_baselin
 
 
 def test_startup_validation_rejects_explicit_candidate_over_automatic_ring_baseline(attention_env):
-    # Review C0: the ring runner is bound to the baseline's explicit flag. An automatic baseline falls
+    # The ring runner is bound to the baseline's explicit flag. An automatic baseline falls
     # back to SDPA ring where an explicit selection of the same backend must raise (ring.py), so the
     # same backend name is not enough.
     schedule = AttentionScheduleConfig(
@@ -1086,7 +1094,7 @@ def test_startup_validation_rejects_explicit_candidate_over_automatic_ring_basel
 
 @pytest.mark.parametrize(("candidate_topk", "accepted"), [(8, False), (4, True)], ids=["different", "same"])
 def test_startup_validation_compares_backend_kwargs_under_ring(attention_env, candidate_topk, accepted):
-    # Review C0: the ring runner never reads backend kwargs, so a quant or sparse setting that differs
+    # The ring runner never reads backend kwargs, so a quant or sparse setting that differs
     # from the baseline's would be dropped without an error. Equal kwargs stay representable.
     baseline = AttentionConfig(default=AttentionSpec(backend="FASTVIDEO_VSA", fastvideo_vsa_topk=4))
     schedule = AttentionScheduleConfig(
@@ -1107,7 +1115,7 @@ def test_startup_validation_compares_backend_kwargs_under_ring(attention_env, ca
 
 
 def test_startup_validation_skips_kv_probe_when_layer_disables_kv_quant(attention_env):
-    # Second-review finding #3: forward-time opt-out must not be rejected at startup.
+    # A layer that opts out of KV-cache quantization at forward time must not be rejected at startup.
     schedule = AttentionScheduleConfig(
         profiles={"quant": AttentionConfig(default=AttentionSpec(backend="SDPA"))},
         default=[{"start": 0, "end": None, "profile": "quant"}],
@@ -1136,7 +1144,7 @@ def test_startup_validation_skips_kv_probe_for_skip_layer_index(attention_env):
 
 
 def test_profiles_with_same_qualname_and_different_impl_classes_do_not_share(attention_env):
-    # Second-review finding #7: the dedup key must use the class, not __qualname__.
+    # The dedup key must use the impl class object, not its __qualname__.
     made = []
 
     def get_impl():
@@ -1160,7 +1168,7 @@ def test_profiles_with_same_qualname_and_different_impl_classes_do_not_share(att
 
 
 def test_unserializable_backend_kwargs_do_not_share_via_repr(attention_env):
-    # Second-review finding #8: equal repr must not collapse two unserializable kwargs dicts.
+    # Equal repr must not collapse two unserializable kwargs dicts.
     class _Marker:
         def __repr__(self):
             return "Marker()"

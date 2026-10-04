@@ -378,7 +378,7 @@ class Wan22I2VPipeline(
         if attention_kwargs is None:
             attention_kwargs = {}
         # Checks a bound attention schedule against the actual sequence and returns its length; None
-        # without a schedule, so unscheduled runs publish no total, as before.
+        # without a schedule, so unscheduled runs publish no total.
         total_steps = begin_scheduled_denoise(len(timesteps))
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):

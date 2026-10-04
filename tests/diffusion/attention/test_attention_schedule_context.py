@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""U3 contracts: request schedule binding, context restore, and layer selection.
+"""Contracts for request schedule binding, context restore, and layer selection.
 
 These tests do not load a model. They pin the shared selection interface that
 entry, scheduler, and runner code must use, and drive the real runner request
@@ -207,8 +207,9 @@ def _automatic_flash_resolve(**kwargs):
     ids=["automatic-flash", "explicit-flash", "explicit-other"],
 )
 def test_fp32_fallback_follows_the_selected_candidate(attention_env, monkeypatch, profile, expected):
-    # The FP32 SDPA fallback used to read the baseline, so on an automatic FLASH_ATTN baseline it
-    # replaced an explicitly selected candidate with SDPA during the candidate's scheduled steps.
+    # The FP32 SDPA fallback is decided from the selected candidate, not from the baseline. On an automatic
+    # FLASH_ATTN baseline, an explicitly selected candidate runs its own implementation on its scheduled
+    # step, and a candidate that is itself an automatic FLASH_ATTN choice falls back to SDPA.
     monkeypatch.setattr(layer_mod, "get_attn_backend_for_role", _automatic_flash_resolve)
     service = AttentionScheduleConfig(
         profiles={"picked": profile}, default=[{"start": 0, "end": 1, "profile": "picked"}]
@@ -453,7 +454,7 @@ def test_scheduler_admits_valid_request_and_rejects_invalid():
     with pytest.raises(ValueError, match="unknown profile") as excinfo:
         scheduler.add_request(invalid)
     assert "bad" not in scheduler._request_states
-    # Review C6: a client input error must reach HTTP as 400, not as a server error.
+    # A client input error must reach HTTP as 400, not as a server error.
     assert client_error_metadata(excinfo.value) == (400, "invalid_attention_schedule")
 
 
@@ -483,7 +484,7 @@ _DENSE_1_2 = [{"start": 1, "end": 2, "profile": "dense"}]
     ids=["disable", "replace", "null-keeps-typed"],
 )
 def test_scheduler_absorbs_schedule_written_into_extra_args_after_construction(schedule, typed, expected):
-    # Review C1: clone() does not re-run __post_init__, so without admission-time absorption the typed
+    # clone() does not re-run __post_init__, so without admission-time absorption the typed
     # field keeps its old value and the request silently runs a schedule it did not ask for.
     scheduler = RequestScheduler()
     scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=_service())
@@ -826,7 +827,7 @@ def test_request_runner_rejects_schedule_without_progress_publisher_before_forwa
 
 def test_request_runner_rejects_schedule_with_cache_backend_before_forward(attention_env, runner_platform):
     # A cache backend reuses or skips transformer evaluations across steps, so the scheduled
-    # attention would not be what ran (KTD6).
+    # attention would not be what ran.
     config = _runner_config(_service())
     config.cache_backend = "tea_cache"
     layer = attention_env.build(config)
@@ -1062,7 +1063,7 @@ def test_startup_loads_pipeline_without_progress_publisher_when_no_schedule_is_c
 
 def test_startup_rejects_profiles_on_pipeline_without_progress_publisher(monkeypatch):
     # With an empty default no request inherits a schedule, but every request that opts in would be
-    # rejected, and under compile the scheduled layers would still call the eager boundary (KTD7).
+    # rejected, and under compile the scheduled layers would still call the eager boundary.
     with pytest.raises(ValueError, match="_StartupSilentPipeline never publishes denoise progress"):
         _load_model(monkeypatch, _StartupSilentPipeline(), schedule=_profiles_only_service())
 

@@ -89,18 +89,20 @@ def test_attention_compile_boundary_without_diffusion_config(monkeypatch, initia
 
 
 @pytest.mark.parametrize(
-    ("configured", "use_hsdp", "with_context", "compiling", "expected"),
+    ("configured", "initialized_with_hsdp", "use_hsdp", "with_context", "compiling", "expected"),
     [
-        (True, False, True, True, ["schedule"]),
-        (True, True, True, True, ["schedule"]),
-        (True, False, False, True, ["schedule"]),
-        (True, False, True, False, ["impl"]),
-        (False, False, True, True, ["impl"]),
-        (False, True, True, True, ["hsdp"]),
+        (True, False, False, True, True, ["schedule"]),
+        (True, False, True, True, True, ["schedule"]),
+        (True, True, False, True, True, ["schedule"]),
+        (True, False, False, False, True, ["schedule"]),
+        (True, False, False, True, False, ["impl"]),
+        (False, False, False, True, True, ["impl"]),
+        (False, False, True, True, True, ["hsdp"]),
     ],
     ids=[
         "scheduled",
         "scheduled-with-hsdp",
+        "scheduled-initialized-with-hsdp",
         "scheduled-without-forward-context",
         "scheduled-eager",
         "unscheduled",
@@ -108,13 +110,14 @@ def test_attention_compile_boundary_without_diffusion_config(monkeypatch, initia
     ],
 )
 def test_attention_uses_schedule_boundary_only_for_scheduled_layers(
-    monkeypatch, configured, use_hsdp, with_context, compiling, expected
+    monkeypatch, configured, initialized_with_hsdp, use_hsdp, with_context, compiling, expected
 ):
-    # KTD7: while compiling, a layer built with a startup schedule calls
-    # _forward_schedule_compile_boundary (a torch.compiler.disable method); the construction-time
-    # flag alone decides this. Unscheduled layers keep the HSDP boundary or the compiled impl as before.
+    # While compiling, a layer built with a startup schedule calls
+    # _forward_schedule_compile_boundary (a torch.compiler.disable method); the schedule flag set at
+    # construction alone decides this, also when HSDP is enabled at construction or in the forward
+    # context. Unscheduled layers call the HSDP boundary or the compiled impl.
     attention = object.__new__(Attention)
-    attention._hsdp_compile_boundary_enabled = False
+    attention._hsdp_compile_boundary_enabled = initialized_with_hsdp
     attention._schedule_configured = configured
     calls: list[str] = []
 

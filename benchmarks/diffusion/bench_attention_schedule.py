@@ -15,6 +15,78 @@ GPU count is a config error (exit code 2). With several stages, or with a
 diffusion stage in another process, the probes do not reach the model, and
 ``run`` stops with exit code 3.
 
+Sessions of one combination (C1 to C6, see ``COMBINATIONS``). Each session
+starts one service:
+    prechange   a service without a schedule, run on the code from before
+                the schedule feature (a checkout on ``PYTHONPATH``);
+                requests ``warmup`` and ``plain``
+    plain       the same two requests on the current code, again without a
+                schedule
+    scheduled   a service that declares the profiles of ``schedule_config``;
+                requests ``warmup``, ``reference_a`` and ``reference_b``
+                (schedule ``[]``: every step dense), ``candidate``
+                (``candidate_schedule``) and, when the config sets it,
+                ``boundary_shift`` (``boundary_shift_schedule``)
+
+Verdict items of one combination. Each is ``pass``, ``fail``, ``not_proven``
+or ``not_measured``, and a ``pass`` proves what is written here:
+    capture           the scheduled record is complete: the requests are in
+                      the expected order, the two references and the candidate
+                      ran without error, each has the expected sequences and
+                      steps, and no block, attention or kernel call was counted
+                      outside a step
+    conditions        ``reference_a`` and ``candidate`` differ only in the
+                      schedule: same prompt, sampling parameters, initial
+                      state, step count and output shape
+    dense_repeatable  the two dense requests give equal digests on every
+                      step, equal final states and equal output bytes, so a
+                      difference of the candidate comes from its schedule
+    profile_switch    on every step the attention layers selected what the
+                      schedule states (the profile, or the layer's own
+                      implementation), the candidate's digests first differ
+                      from the reference at the first profile step, and a
+                      call of the configured kind ran on that step
+    dense_prefix      before the first profile step the candidate's digests
+                      equal those of ``reference_a`` on every step
+    kernel_target     the profile steps reached the FlashInfer kernel of
+                      ``TRTLLM_ATTN`` with the arguments of the profile's kind
+                      (SAGE scale factors for ``quantized``, a positive
+                      skip-softmax factor for ``sparse``) on at least one
+                      attention call
+    compiled_graphs   the blocks of every model were compiled without error and
+                      every block call of ``reference_a`` and ``candidate``
+                      ran a compiled graph, none ran eagerly
+    shifted_boundary  the ``boundary_shift`` request selected what its
+                      schedule states, compiled no new graph and ran compiled
+                      graphs only: moving the first profile step needs no
+                      new compilation
+    timing            the seconds per step are usable for a comparison: every
+                      sample is present, the batch size is 1, no graph was
+                      compiled in a measured request and the warm-up ran
+                      every selection first. The item applies no speed
+                      threshold; the report holds the samples and medians
+    lpips             an LPIPS score of the candidate output against the
+                      ``reference_a`` output was computed over aligned frames
+                      and is stored with its metadata. No threshold applies
+    video             the side-by-side video and the videos of
+                      ``reference_a`` and ``candidate`` are in the evidence
+                      directory and match their recorded sha256
+    backend_report    the attention probe was installed and every step of
+                      ``reference_a`` and ``candidate`` holds the selection,
+                      backend, outcome and kernel counters
+    no_schedule       the ``plain`` session equals the ``prechange`` session
+                      bit for bit (step digests, final state, output), or
+                      differs within ``no_schedule_tolerance``, and the
+                      ``prechange`` record comes from the source that
+                      ``prechange_source`` states
+
+A combination is proven when every item except ``shifted_boundary`` passes.
+The first line of the ``verdict`` summary is ``Acceptance: SUCCESS`` when all
+six combinations are proven and ``shifted_boundary`` passed on at least one of
+them and failed on none; otherwise it is ``Acceptance: NOT PROVEN``. The
+second line, ``Shifted boundary: ...``, lists the combinations on which that
+item passed and failed.
+
 Requirements for ``run``:
     pip install lpips Pillow numpy
 
@@ -146,8 +218,9 @@ COMPILE_MECHANISM = "torch._TorchCompileInductorWrapper.__call__"
 H3_LOOP_PARAMETERS = ("on_step", "step_profiler", "initial_video_rows", "initial_audio_rows", "sigmas_video")
 
 SCHEDULED_REQUESTS = ("warmup", "reference_a", "reference_b", "candidate")
+# Reasons _classify_attention gives for a layer call that selected a profile and ran no approximate kernel call.
 FALLBACK_REASONS = (
-    "short_kv",
+    "sage_not_applied",
     "ignored_layer",
     "private_gate",
     "profile_not_approximate",
@@ -163,30 +236,30 @@ ITEM_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "capture": (),
     "conditions": ("capture",),
     "dense_repeatable": ("capture",),
-    "R7_switch": ("capture", "conditions"),
-    "R9_dense_prefix": ("capture", "conditions", "dense_repeatable"),
-    "R10_target": ("capture",),
-    "R10_compiled": ("capture",),
-    "AE5_boundary": ("capture",),
-    "R8_timing": ("capture",),
-    "R8_lpips": ("conditions",),
-    "R8_video": ("conditions",),
-    "R8_backend_report": ("capture",),
+    "profile_switch": ("capture", "conditions"),
+    "dense_prefix": ("capture", "conditions", "dense_repeatable"),
+    "kernel_target": ("capture",),
+    "compiled_graphs": ("capture",),
+    "shifted_boundary": ("capture",),
+    "timing": ("capture",),
+    "lpips": ("conditions",),
+    "video": ("conditions",),
+    "backend_report": ("capture",),
 }
-# R9_no_schedule reads the plain and pre-change sessions and has no dependency.
+# no_schedule reads the plain and pre-change sessions and has no dependency.
 REQUIRED_ITEMS = (
     "capture",
     "conditions",
     "dense_repeatable",
-    "R7_switch",
-    "R8_timing",
-    "R8_lpips",
-    "R8_video",
-    "R8_backend_report",
-    "R9_dense_prefix",
-    "R9_no_schedule",
-    "R10_target",
-    "R10_compiled",
+    "profile_switch",
+    "timing",
+    "lpips",
+    "video",
+    "backend_report",
+    "dense_prefix",
+    "no_schedule",
+    "kernel_target",
+    "compiled_graphs",
 )
 
 _CONFIG_REQUIRED = (
@@ -711,12 +784,17 @@ def _classify_attention(info: Mapping[str, Any], kernel_calls: Sequence[Mapping[
         return ["fallback.layer_fallback"]
     quant, skip_enabled, skip_configured = info.get("quant"), info.get("skip_enabled"), info.get("skip_configured")
     if quant is True:
-        return ["fallback.short_kv"]
+        # Quantization is enabled on the implementation and kernel calls were seen, but none carried
+        # SAGE scale factors. The current TRTLLM backend passes the scale factors on every kernel call
+        # when quantization is enabled, so it is not expected to produce this state.
+        return ["fallback.sage_not_applied"]
     if skip_configured is True and skip_enabled is False:
         return ["fallback.ignored_layer"]
     if skip_enabled is True:
         return ["fallback.private_gate"]
     if quant is False and skip_enabled is False and skip_configured is False:
+        # A TRTLLM profile that configures only quantization is also counted here on a causal layer:
+        # the backend disables quantization on causal layers when it builds the implementation.
         return ["fallback.profile_not_approximate"]
     return ["fallback.unclassified"]
 
@@ -2571,6 +2649,7 @@ def _sequence_problems(reader: _Reader, index: int, source: str, total_steps: in
 
 
 def _rule_capture(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when the scheduled record is complete: expected requests, sequences and steps, no call outside a step."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     reasons = []
     if reader.get("/schema") != SCHEMA:
@@ -2601,6 +2680,7 @@ def _rule_capture(scheduled: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _rule_conditions(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when reference_a and candidate differ in the schedule only: same prompt, parameters, start state, shape."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     reference, candidate = context.indices["reference_a"], context.indices["candidate"]
@@ -2656,6 +2736,7 @@ def _first_difference(
 
 
 def _rule_dense_repeatable(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when reference_a and reference_b, both dense, give equal step digests, final states and output bytes."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     first, second = context.indices["reference_a"], context.indices["reference_b"]
@@ -2721,7 +2802,8 @@ def _selection_mismatches(
     return mismatches
 
 
-def _rule_r7_switch(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_profile_switch(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when every step selects as scheduled and the first profile step runs the target kind and differs first."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     reader.get("/config/candidate_schedule")
@@ -2748,7 +2830,8 @@ def _rule_r7_switch(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     return _decide(sorted(set(fail)), sorted(set(unproven)), reader.evidence, values)
 
 
-def _rule_r9_dense_prefix(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_dense_prefix(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when the candidate's digests equal those of reference_a on every step before the first profile step."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     switch = context.switch
@@ -2794,9 +2877,10 @@ def _plain_capture_ok(reader: _Reader) -> tuple[bool, int | None]:
     return not problems, index
 
 
-def _rule_r9_no_schedule(
+def _rule_no_schedule(
     scheduled: Mapping[str, Any] | None, plain: Mapping[str, Any] | None, prechange: Mapping[str, Any] | None
 ) -> dict[str, Any]:
+    """Pass when plain equals the confirmed pre-change session bit for bit, or differs within the stated tolerance."""
     if plain is None or prechange is None:
         return _item("not_measured", ["plain_or_prechange_session_absent"])
     plain_reader = _Reader(plain, SESSION_FILES["plain"])
@@ -2903,7 +2987,8 @@ def _fallback_report(reader: _Reader, context: _Scheduled, *, note: bool) -> dic
     }
 
 
-def _rule_r10_target(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_kernel_target(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when the probed kernel is FlashInfer's and some layer call on a profile step is of the profile's kind."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     selected = {name for name in context.expected if name is not None}
@@ -2925,7 +3010,8 @@ def _rule_r10_target(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     return _item("pass", (), reader.evidence, values)
 
 
-def _rule_r10_compiled(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_compiled_graphs(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when the blocks were compiled without error and no block call of reference_a or candidate ran eagerly."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     fail, unproven, values = [], [], {}
@@ -2963,7 +3049,8 @@ def _rule_r10_compiled(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     return _decide(sorted(set(fail)), sorted(set(unproven)), reader.evidence, values)
 
 
-def _rule_ae5_boundary(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_shifted_boundary(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when boundary_shift selects as its schedule states, compiles no new graph and runs compiled graphs only."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     shifted_schedule = reader.get("/config/boundary_shift_schedule", note=False)
@@ -3024,7 +3111,8 @@ def _step_seconds(reader: _Reader, context: _Scheduled, request: str, *, note: b
     return samples
 
 
-def _rule_r8_timing(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_timing(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when the timing samples are complete and comparable; it reports them and applies no speed threshold."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     unproven = []
@@ -3082,7 +3170,8 @@ def _rule_r8_timing(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     return _item("pass", (), reader.evidence, values)
 
 
-def _rule_r8_lpips(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_lpips(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when an LPIPS score of candidate against reference_a is stored with its metadata; no threshold applies."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     if reader.get("/comparison", note=False) is None:
@@ -3130,7 +3219,8 @@ def _artifact_problem(directory: Path | None, file_name: Any, sha256: Any) -> st
         return "artifact_missing"
 
 
-def _rule_r8_video(scheduled: Mapping[str, Any], directory: Path | None) -> dict[str, Any]:
+def _rule_video(scheduled: Mapping[str, Any], directory: Path | None) -> dict[str, Any]:
+    """Pass when the side-by-side video and both request videos exist and match their recorded sha256."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     if reader.get("/comparison", note=False) is None:
@@ -3160,7 +3250,8 @@ def _rule_r8_video(scheduled: Mapping[str, Any], directory: Path | None) -> dict
     return _decide(fail, unproven, reader.evidence)
 
 
-def _rule_r8_backend_report(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+def _rule_backend_report(scheduled: Mapping[str, Any]) -> dict[str, Any]:
+    """Pass when the attention probe was installed and reference_a and candidate hold an attention record per step."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     installed = reader.get("/probes/installed")
@@ -3257,15 +3348,15 @@ def evaluate_combination(
         "capture": lambda: _guard(_rule_capture, scheduled),
         "conditions": lambda: _guard(_rule_conditions, scheduled),
         "dense_repeatable": lambda: _guard(_rule_dense_repeatable, scheduled),
-        "R7_switch": lambda: _guard(_rule_r7_switch, scheduled),
-        "R9_dense_prefix": lambda: _guard(_rule_r9_dense_prefix, scheduled),
-        "R10_target": lambda: _guard(_rule_r10_target, scheduled),
-        "R10_compiled": lambda: _guard(_rule_r10_compiled, scheduled),
-        "AE5_boundary": lambda: _guard(_rule_ae5_boundary, scheduled),
-        "R8_timing": lambda: _guard(_rule_r8_timing, scheduled),
-        "R8_lpips": lambda: _guard(_rule_r8_lpips, scheduled),
-        "R8_video": lambda: _guard(_rule_r8_video, scheduled, folder),
-        "R8_backend_report": lambda: _guard(_rule_r8_backend_report, scheduled),
+        "profile_switch": lambda: _guard(_rule_profile_switch, scheduled),
+        "dense_prefix": lambda: _guard(_rule_dense_prefix, scheduled),
+        "kernel_target": lambda: _guard(_rule_kernel_target, scheduled),
+        "compiled_graphs": lambda: _guard(_rule_compiled_graphs, scheduled),
+        "shifted_boundary": lambda: _guard(_rule_shifted_boundary, scheduled),
+        "timing": lambda: _guard(_rule_timing, scheduled),
+        "lpips": lambda: _guard(_rule_lpips, scheduled),
+        "video": lambda: _guard(_rule_video, scheduled, folder),
+        "backend_report": lambda: _guard(_rule_backend_report, scheduled),
     }
     items: dict[str, dict[str, Any]] = {}
     for name, dependencies in ITEM_DEPENDENCIES.items():
@@ -3277,7 +3368,7 @@ def evaluate_combination(
             items[name] = _item("not_proven", [f"depends:{dependency}" for dependency in blocked])
         else:
             items[name] = rules[name]()
-    items["R9_no_schedule"] = _guard(_rule_r9_no_schedule, scheduled, plain, prechange)
+    items["no_schedule"] = _guard(_rule_no_schedule, scheduled, plain, prechange)
 
     if scheduled is None:
         status = "not_measured"
@@ -3285,17 +3376,17 @@ def evaluate_combination(
         status = "success"
     else:
         status = "not_success"
-    timing = dict(items["R8_timing"]["values"])
+    timing = dict(items["timing"]["values"])
     if timing:
         timing["plain"] = _plain_seconds(plain)
     comparison = scheduled.get("comparison") if isinstance(scheduled, Mapping) else None
     report = {
         "seconds_per_step": timing,
-        "lpips": dict(items["R8_lpips"]["values"]),
+        "lpips": dict(items["lpips"]["values"]),
         "side_by_side": (comparison or {}).get("side_by_side") if isinstance(comparison, Mapping) else None,
-        "backend": dict(items["R8_backend_report"]["values"]),
-        "target": dict(items["R10_target"]["values"]),
-        "no_schedule": dict(items["R9_no_schedule"]["values"]),
+        "backend": dict(items["backend_report"]["values"]),
+        "target": dict(items["kernel_target"]["values"]),
+        "no_schedule": dict(items["no_schedule"]["values"]),
         "reference_vs_plain": _reference_vs_plain(scheduled, plain),
     }
     return {"combination": combination, "status": status, "items": items, "report": report}
@@ -3304,35 +3395,38 @@ def evaluate_combination(
 def evaluate_matrix(combinations: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
     """All six combinations must be proven; the shifted-boundary check must pass on one and fail on none."""
     statuses = {name: (combinations.get(name) or {}).get("status", "not_measured") for name in COMBINATIONS}
-    ae5 = {
-        name: ((combinations.get(name) or {}).get("items") or {}).get("AE5_boundary", {}).get("status", "not_measured")
+    shifted = {
+        name: ((combinations.get(name) or {}).get("items") or {})
+        .get("shifted_boundary", {})
+        .get("status", "not_measured")
         for name in COMBINATIONS
     }
-    passed = [name for name, status in ae5.items() if status == "pass"]
-    failed = [name for name, status in ae5.items() if status == "fail"]
+    passed = [name for name, status in shifted.items() if status == "pass"]
+    failed = [name for name, status in shifted.items() if status == "fail"]
     if failed:
-        ae5_status = "fail"
+        shifted_status = "fail"
     elif passed:
-        ae5_status = "pass"
-    elif "not_proven" in ae5.values():
-        ae5_status = "not_proven"
+        shifted_status = "pass"
+    elif "not_proven" in shifted.values():
+        shifted_status = "not_proven"
     else:
-        ae5_status = "not_measured"
-    proven = all(status == "success" for status in statuses.values()) and ae5_status == "pass"
+        shifted_status = "not_measured"
+    proven = all(status == "success" for status in statuses.values()) and shifted_status == "pass"
     return {
         "status": "success" if proven else "not_success",
         "missing": [name for name, status in statuses.items() if status == "not_measured"],
-        "ae5": {"status": ae5_status, "combinations": passed, "failed": failed},
+        "shifted_boundary": {"status": shifted_status, "combinations": passed, "failed": failed},
     }
 
 
 def render_summary(combinations: Mapping[str, Mapping[str, Any]], matrix: Mapping[str, Any]) -> str:
-    """Return the text summary. Its first line is the only place that states a result for R7-R10."""
-    lines = ["R7-R10: SUCCESS" if matrix.get("status") == "success" else "R7-R10: NOT PROVEN"]
-    ae5 = matrix.get("ae5") or {}
+    """Return the text summary. Its first line is the only place that states the overall result."""
+    lines = ["Acceptance: SUCCESS" if matrix.get("status") == "success" else "Acceptance: NOT PROVEN"]
+    shifted = matrix.get("shifted_boundary") or {}
     lines.append(
-        f"AE5 shifted boundary: {ae5.get('status')}; passed on {', '.join(ae5.get('combinations') or []) or 'none'}; "
-        f"failed on {', '.join(ae5.get('failed') or []) or 'none'}"
+        f"Shifted boundary: {shifted.get('status')}; "
+        f"passed on {', '.join(shifted.get('combinations') or []) or 'none'}; "
+        f"failed on {', '.join(shifted.get('failed') or []) or 'none'}"
     )
     for name in COMBINATIONS:
         result = combinations.get(name)
@@ -3446,7 +3540,9 @@ def _run_preflight(args: argparse.Namespace) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Acceptance harness for step-index attention schedules.")
+    parser = argparse.ArgumentParser(
+        description="Acceptance harness for step-index attention schedules. Verdict items: see the module docstring."
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     preflight_parser = commands.add_parser("preflight", help="check probe targets and compile probes without weights")
     preflight_parser.add_argument("--config", required=True)
@@ -3458,7 +3554,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--session", choices=SESSIONS, required=True)
     run_parser.add_argument("--out", required=True, help="evidence directory outside the repository")
     run_parser.add_argument("--prior", help="pre-change session record; only with --session plain")
-    verdict_parser = commands.add_parser("verdict", help="decide from session records; standard library only")
+    verdict_parser = commands.add_parser(
+        "verdict", help="evaluate the verdict items from session records and print the summary; standard library only"
+    )
     verdict_parser.add_argument("--out", required=True, help="verdict file outside the repository")
     verdict_parser.add_argument("directories", nargs="+", help="one evidence directory per combination")
     return parser

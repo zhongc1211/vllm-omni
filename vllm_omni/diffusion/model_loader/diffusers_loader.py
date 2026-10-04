@@ -1037,17 +1037,16 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         )
 
         cfg = getattr(self.od_config, "diffusion_attention_config", None)
-        # KTD8: a schedule profile can be the only spec carrying calibration, so discovery has to
+        # A schedule profile can be the only spec carrying calibration, so discovery has to
         # look past the baseline config or that candidate would stay dense at runtime.
         schedule = getattr(self.od_config, "diffusion_attention_schedule", None)
         apply_skip_softmax_calibration(cfg, model, schedule=schedule)
 
     def _validate_attention_schedule_candidates(self, model: nn.Module) -> int:
-        """KTD6: reject an incompatible prepared candidate before the model is served.
+        """Reject an incompatible prepared candidate before the model is served.
 
         The traversal resolves the same per-candidate calibration dict that stamping uses. It does
-        not read stamped impl state. Without a schedule it returns 0 and walks nothing, leaving the
-        ordinary load path unchanged.
+        not read stamped impl state. Without a schedule it returns 0 and walks nothing.
         """
         if getattr(self.od_config, "diffusion_attention_schedule", None) is None:
             return 0

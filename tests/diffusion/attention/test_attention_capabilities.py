@@ -357,3 +357,75 @@ def test_layer_resolution_uses_effective_kv_quantization(skip_quant):
     assert result.path == ("npu_dense" if skip_quant else "npu_unverified")
     assert result.support.status is SupportStatus.UNMIGRATED
     assert metadata.extra == {"kv_cache_dtype": "fp8"}
+
+
+def test_layer_resolution_reports_attention_schedule_boundary(monkeypatch):
+    from vllm_omni.diffusion.attention.layer import Attention, _PreparedCandidate
+    from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
+    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+    from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
+
+    # One entry per call that reaches an implementation: which one, and the boundaries it was given.
+    resolved: list[tuple[str, frozenset[OuterBoundary]]] = []
+
+    def recording_impl(name):
+        impl = _impl()
+        resolve_execution_path = impl.resolve_execution_path
+
+        def record_execution_path(context, query, key, value, attn_metadata):
+            resolved.append((name, context.outer_boundaries))
+            return resolve_execution_path(context, query, key, value, attn_metadata)
+
+        monkeypatch.setattr(impl, "resolve_execution_path", record_execution_path)
+        return impl
+
+    layer = Attention.__new__(Attention)
+    torch.nn.Module.__init__(layer)
+    layer.attention = recording_impl("baseline")
+    layer._hsdp_compile_boundary_enabled = False
+    layer.skip_sequence_parallel = True
+    layer._no_parallel_strategy = NoParallelAttention()
+    layer.parallel_strategy = layer._no_parallel_strategy
+    layer.use_ring = False
+    layer.paged_kv_cache_role = None
+    layer._kv_cache_dtype = None
+    layer._disable_kv_quant = False
+    layer._kv_cache_skip_steps = None
+    layer._kv_cache_skip_layers = None
+    layer.layer_idx = 0
+    context = ExecutionContext(platform="cuda", require_fullgraph=True)
+    query = torch.empty((1, 16, 8, 64), dtype=torch.bfloat16)
+
+    # Neither the schedule flag nor attn_backend is set here, so this call must work without them. It
+    # reports the FA4 dense path and adds no boundary.
+    result = layer.resolve_execution_path(context, query, query, query, None)
+    assert resolved == [("baseline", frozenset())]
+    assert result.path == "fa4_dense"
+    assert result.compilation_mode is CompilationMode.CUSTOM_OP
+    assert result.requested_support(context).status is SupportStatus.SUPPORTED
+
+    # Attention.__init__ sets the flag on a layer built with a schedule. That layer runs behind the
+    # eager schedule boundary while compiling, so the same inputs have no fullgraph path.
+    layer._schedule_configured = True
+    layer.attn_backend = FlashAttentionBackend
+    result = layer.resolve_execution_path(context, query, query, query, None)
+    assert resolved[-1] == ("baseline", frozenset({OuterBoundary.ATTENTION_SCHEDULE}))
+    assert result.support.status is SupportStatus.UNMIGRATED
+    assert result.compilation_mode is CompilationMode.EAGER_ONLY
+    assert result.requested_support(context).status is SupportStatus.UNSUPPORTED
+
+    # Inside a denoise step the layer resolves the candidate that the bound schedule selects.
+    candidate = _PreparedCandidate(
+        backend_cls=FlashAttentionBackend,
+        spec=None,
+        impl_cls=FlashAttentionImpl,
+        impl=recording_impl("candidate"),
+        backend_explicit=False,
+        backend_pref="FLASH_ATTN",
+    )
+    layer._schedule_candidates = {"approx": candidate}
+    schedule = (AttentionScheduleRange(start=0, end=None, profile="approx"),)
+    with set_forward_context(denoise_step_idx=0), bind_attention_schedule(schedule, denoise=True):
+        get_forward_context().total_denoise_steps = 4
+        layer.resolve_execution_path(context, query, query, query, None)
+    assert resolved[-1] == ("candidate", frozenset({OuterBoundary.ATTENTION_SCHEDULE}))

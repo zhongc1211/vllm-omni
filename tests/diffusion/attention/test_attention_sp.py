@@ -821,12 +821,12 @@ def ulysses_attention_on_test_model(
         destroy_distributed_env()
 
 
-# --- U2 slice-3: SP auto-pad capability probe must see every prepared candidate ----
+# --- SP auto-pad capability probe must see the schedule's profiles ----------------
 #
-# Auto-pad decides mask support before Attention layers exist, so it probes the selector
+# Auto-pad decides mask support at pad time from the config alone, so it probes the selector
 # instead of a live backend. With a step schedule the runtime may switch to a prepared
 # candidate, so a probe that only reads the baseline config can approve a padding layout
-# that the selected candidate cannot execute (KTD6: fail at startup, not in the kernel).
+# that the selected candidate cannot execute. The probe must reject it, not the kernel.
 
 
 def _cap_backend(name: str, mask: bool):

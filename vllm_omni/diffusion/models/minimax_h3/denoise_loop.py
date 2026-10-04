@@ -365,10 +365,14 @@ def minimax_h3_denoise_loop(
     if audio_edit is not None:
         audio_edit = audio_edit.to(device=device, dtype=torch.float32)
 
-    # Each call denoises one sequence from step 0. forward() runs one call per
-    # output seed and per continuation window, all with the same num_steps, so
-    # an attention schedule selects profiles on each call from step 0. The
-    # pipeline checks the schedule against num_steps before the first call.
+    # Each call denoises one sequence and publishes its steps from 0 with its
+    # own num_steps. forward() runs one call per output seed and per
+    # continuation window, all with the main num_steps, and with latent_refine
+    # one more call per output seed over the tail of the sigma list, which has
+    # its own num_steps. An attention schedule selects profiles on each call
+    # from step 0. The pipeline checks the schedule against the main num_steps
+    # before the first call and rejects a schedule together with latent_refine,
+    # so a request with a schedule runs only calls with the main num_steps.
     num_steps = len(sigmas_video) - 1
     for step in range(num_steps):
         check_request_cancellation()

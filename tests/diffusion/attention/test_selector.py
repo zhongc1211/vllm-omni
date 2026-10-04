@@ -175,7 +175,7 @@ def test_load_backend_cls_reports_missing_class(monkeypatch):
 
 
 def test_capability_backends_cover_baseline_and_every_profile(monkeypatch):
-    # U2 slice-3: capability probes must see all prepared candidates, not just the baseline.
+    # Capability probes must see the schedule's profiles, not just the baseline.
     monkeypatch.setattr(selector, "_cached_get_backend_cls", lambda *args, **kwargs: _PlatformBackend)
     schedule = AttentionScheduleConfig(
         profiles={
@@ -187,7 +187,7 @@ def test_capability_backends_cover_baseline_and_every_profile(monkeypatch):
 
     entries = selector.resolve_capability_backends(role="self", attention_config=AttentionConfig(), schedule=schedule)
 
-    # Review finding #8: an implicit profile resolves through the platform default with an unknown
+    # An implicit profile resolves through the platform default with an unknown
     # head size and may be promoted at construction, so the probe cannot speak for it. Only explicit
     # profiles are enumerated; the post-load traversal judges prepared candidates from their own
     # backend_cls and spec.

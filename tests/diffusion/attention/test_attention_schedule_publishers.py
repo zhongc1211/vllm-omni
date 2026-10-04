@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""U4 contracts shared by every denoise progress publisher.
+"""Contracts shared by every denoise progress publisher.
 
 These tests do not load a model. A toy publisher with no model code drives a
 real Attention layer with prepared fake candidates through the shared helpers:
@@ -227,7 +227,7 @@ class _ToyPublisher(DenoiseProgressMixin):
 
 
 def test_toy_publisher_selects_by_integer_step_against_the_actual_total(attention_env, monkeypatch):
-    # AE2: 8 steps with [3, 6) on "sparse"; the open range [7, None) ends at the actual total.
+    # 8 steps with [3, 6) on "sparse"; the open range [7, None) ends at the actual total.
     config = _make_config(schedule=_service())
     layer = attention_env.build(config)
     calls = _record_forwards(layer, monkeypatch)
@@ -267,7 +267,7 @@ def test_toy_publisher_selection_ignores_numeric_timesteps(attention_env, monkey
 def test_toy_publisher_without_a_schedule_publishes_no_total_and_runs_the_baseline(
     attention_env, monkeypatch, configured, schedule
 ):
-    # R9: an unscheduled run publishes what it published before U4, which had no total.
+    # Without a schedule the publisher publishes no total.
     config = _make_config(schedule=_service() if configured else None)
     layer = attention_env.build(config)
     calls = _record_forwards(layer, monkeypatch)
@@ -302,7 +302,7 @@ def test_toy_publisher_checks_and_selects_each_restarted_sequence_on_its_own(att
 
 
 def test_toy_publisher_rejects_a_short_sequence_before_any_attention_call(attention_env, monkeypatch):
-    # AE4: the request asked for 8 steps, but the loop builds 5, as with a fixed DMD table.
+    # The request asked for 8 steps, but the loop builds 5, as with a fixed DMD table.
     config = _make_config(schedule=_service())
     layer = attention_env.build(config)
     calls = _record_forwards(layer, monkeypatch)
@@ -485,7 +485,7 @@ def test_request_denoise_progress_requires_a_forward_context():
 
 
 def test_sequential_request_scopes_select_their_own_profiles_without_leaking(attention_env):
-    # AE3 in step mode (KTD5): requests at different steps share one denoise_step call and are
+    # Step mode: requests at different steps share one denoise_step call and are
     # evaluated one at a time, each under its own step, total and timestep.
     config = _make_config(schedule=_service())
     layer = attention_env.build(config)

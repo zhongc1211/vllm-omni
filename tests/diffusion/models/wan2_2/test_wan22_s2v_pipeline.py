@@ -1003,7 +1003,7 @@ def test_s2v_forward_applies_schedule_to_each_clip_and_clears_between_clips(monk
     denoise = [("denoise", step, total, scheduled) for step in range(3)]
     # Each clip restarts at step 0 and is checked against its own 3 steps. With a schedule, audio
     # encoding before the second clip and the work after the last clip see no active step. Without
-    # one, the last step stays published, as before.
+    # one, the last step stays published.
     between = ("audio", None, None, False) if scheduled else ("audio", 2, None, False)
     end = ("end", None, None, False) if scheduled else ("end", 2, None, False)
     assert events == [("audio", None, None, False), *denoise, between, *denoise, end]

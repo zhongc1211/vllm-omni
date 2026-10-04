@@ -2873,9 +2873,11 @@ class MiniMaxH3Pipeline(
         self._prepare_adaln_adapter(sampling)
         base_schedule, num_steps = self._resolve_sigma_positions(task, sampling)
         # num_steps is the length of the sequence this request denoises; FastH3 and pinned distilled
-        # schedules can differ from num_inference_steps. Both execution modes reach this point before any
-        # denoise forward. Step mode runs it outside the forward context, so the request's own schedule is
-        # resolved against the service default; in request mode that is the schedule the runner bound.
+        # schedules can differ from num_inference_steps. A latent_refine pass has its own step count, which
+        # this check does not cover, so a schedule together with latent_refine is rejected below. Both
+        # execution modes reach this point before any denoise forward. Step mode runs it outside the forward
+        # context, so the request's own schedule is resolved against the service default; in request mode
+        # that is the schedule the runner bound.
         attention_schedule = require_request_attention_schedule_fits(
             SimpleNamespace(sampling_params=sampling), self.od_config, num_steps
         )
@@ -2911,6 +2913,18 @@ class MiniMaxH3Pipeline(
             raise InvalidAttentionScheduleError(
                 "attention_schedule cannot be combined with MiniMax H3 Cache-DiT (quality=high, or an omitted "
                 "quality on a server started with Cache-DiT); send quality=lossless or attention_schedule=[]"
+            )
+        if attention_schedule and self._resolve_latent_refine(extra) is not None:
+            # latent_refine runs a second denoise sequence over the tail of the sigma list. It publishes step
+            # indexes from 0 and its own step count, and the schedule was checked against num_steps only. A
+            # range could select a profile at another sigma position there, or fall outside the refine
+            # sequence and fail in the attention layer after the first pass has run. An invalid latent_refine
+            # value raises its own client error from the resolver.
+            raise InvalidAttentionScheduleError(
+                "attention_schedule cannot be combined with MiniMax H3 latent_refine (a latent_refine in the "
+                "request, or an omitted latent_refine on a server that sets one in --additional-config): the "
+                "refine pass is a second denoise sequence with its own step count; send attention_schedule=[] "
+                "or latent_refine=false"
             )
         self._cache_dit_runtime.prepare(quality_plan.cache_dit)
         upscale_target = self._resolve_latent_upscale(

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""U5: scheduled attention under a real torch.compile.
+"""Scheduled attention under a real torch.compile.
 
 A two-block toy transformer is compiled with the production ``regionally_compile`` helper and a
 Dynamo backend that keeps every captured graph and counts its executions. Each block runs a linear
@@ -11,7 +11,7 @@ The baseline and the prepared candidates compute scaled dot-product attention on
 TRTLLM_ATTN candidates subclass the production implementation, so ``__init__``, the skip config and
 ``_resolve_skip_factor`` (including the timestep gate) are production code. ``forward`` is replaced
 by the SDPA math and passes ``key.shape[1]``, which equals the ``max_kv_len`` of ``forward_cuda`` for
-the unpacked inputs used here. ``forward_cuda`` and the kernel are U6 evidence.
+the unpacked inputs used here. ``forward_cuda`` and the kernel are not exercised here.
 
 Each compiled test records, per denoise step, which implementation ran, how often each compiled
 graph ran, how many graphs exist and how many times Dynamo's frame converter was called. That count
@@ -50,7 +50,7 @@ The runs that the checks must reject (forced eager, Dynamo's recompile-limit fal
 failure with and without ``suppress_errors`` and a fullgraph compile of a scheduled layer) print
 records in the same format. Each such record has a ``rejected`` field with the first line of the
 check that rejected the run, or a ``raised`` field with the type of the exception the run raised.
-Compilation on the target backend and Inductor is U6 evidence and is not covered here.
+Compilation on the target backend and Inductor is not covered here.
 """
 
 import json
@@ -606,7 +606,7 @@ def _expected(labels, entries, blocks=_BLOCKS):
 
 
 def test_unseen_boundaries_across_requests_add_no_graph(compile_env):
-    # AE5: after the first step, none of the requests below adds a graph or compiles a frame,
+    # After the first step, none of the requests below adds a graph or compiles a frame,
     # although three of them use boundaries the model has not run and one runs six steps instead of
     # eight, so the open range [3, None) ends at another step and the published total changes. The
     # same shapes run in every request; the ranges, the step count and the timesteps change. The two
@@ -642,7 +642,7 @@ def test_unseen_boundaries_across_requests_add_no_graph(compile_env):
 
 
 def test_dense_approximate_dense_keeps_the_prefix_and_routes_back(compile_env):
-    # R9: the steps before the first switch match an all-dense run bit for bit. The run switches
+    # The steps before the first switch match an all-dense run bit for bit. The run switches
     # back to dense after the range; the trajectory after the switch is not compared with all-dense.
     pipeline = _pipeline(AttentionScheduleConfig(profiles={"approx": _trtllm(0.5)}))
     schedule = _ranges((2, 5, "approx"))
@@ -787,7 +787,7 @@ def test_production_compile_settings_compile_only_in_the_first_step(compile_env,
 def test_copied_candidate_output_compiles_only_when_it_first_runs(
     compile_env, monkeypatch, output_copy, dynamic, inference_mode
 ):
-    # KTD7 allows a finite number of graph variants for a finite candidate set. The frame that
+    # A finite candidate set may add a finite number of graph variants. The frame that
     # resumes after the attention call takes the tensor the eager boundary returns as an input, and
     # Dynamo guards properties of that input. Here the approximate candidate returns another tensor
     # than the dense result. With "other-strides" it has other strides but is the same kind of

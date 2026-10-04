@@ -225,7 +225,7 @@ def test_apply_to_pipeline_routes_and_ignores():
 
 
 def test_apply_to_pipeline_stamps_all_schedule_candidates():
-    """KTD8: every prepared candidate impl gets the same per-layer calibration as the baseline."""
+    """Every prepared candidate impl without its own curve gets the baseline's per-layer calibration."""
     from types import SimpleNamespace
 
     import torch.nn as nn
@@ -248,11 +248,11 @@ def test_apply_to_pipeline_stamps_all_schedule_candidates():
 
 
 def test_apply_to_pipeline_stamps_trtllm_candidate_under_dense_baseline():
-    """KTD8: a skip-softmax candidate under a dense baseline is still calibrated.
+    """A skip-softmax candidate under a dense baseline is still calibrated.
 
-    The pre-slice-2 code keyed off module.attention having set_layer_calibration and
-    skipped the whole layer otherwise, so a dense baseline with a TRTLLM candidate
-    would leave that candidate uncalibrated.
+    apply_to_pipeline checks the baseline impl and each candidate impl separately for
+    set_layer_calibration, so a dense baseline without that method does not leave a TRTLLM
+    candidate on the same layer uncalibrated.
     """
     from types import SimpleNamespace
 
@@ -296,7 +296,7 @@ def test_apply_to_pipeline_ignored_layer_skips_baseline_and_candidates():
     assert stamped == 0
 
 
-# --- U2 slice-3: calibration discovery must reach schedule-only profiles (KTD8) ----
+# --- Calibration discovery must reach schedule-only profiles ---------------------
 
 
 def test_collect_calibration_specs_covers_baseline_and_every_profile():
@@ -371,8 +371,8 @@ def test_apply_skip_softmax_calibration_discovers_profile_only_calibration():
 
 
 def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
-    # Second-review finding #1: a candidate with its own skip_calibration must not receive the
-    # first dict. The baseline still receives that fallback.
+    # A candidate with its own skip_calibration must not receive the fallback dict. The baseline
+    # and a candidate without its own dict still receive that fallback.
     from types import SimpleNamespace
 
     import torch.nn as nn
@@ -406,7 +406,7 @@ def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
 
 
 def test_apply_to_pipeline_counts_a_shared_impl_once():
-    # Second-review finding #4: two profile names that share one impl are one stamp, not two.
+    # Two profile names that share one impl are one stamp, not two.
     from types import SimpleNamespace
 
     import torch.nn as nn

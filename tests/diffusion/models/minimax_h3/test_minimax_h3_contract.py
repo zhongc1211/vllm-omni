@@ -1051,7 +1051,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     return pipeline
 
 
-def _t2va_batch(num_inference_steps=None, attention_schedule=None):
+def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -1063,7 +1063,7 @@ def _t2va_batch(num_inference_steps=None, attention_schedule=None):
         fps=24,
         num_frames=124,
         num_inference_steps=num_inference_steps,
-        extra_args={"task": "t2va", "aspect_ratio": "16:9"},
+        extra_args={"task": "t2va", "aspect_ratio": "16:9", **(extra_args or {})},
         attention_schedule=attention_schedule,
     )
     return DiffusionRequestBatch(
@@ -1130,13 +1130,16 @@ def test_distilled_forward_rejects_a_mismatched_explicit_step_count():
         pipeline.forward(_t2va_batch(num_inference_steps=50))
 
 
-def _scheduled_od_config():
-    """Service config with one prepared profile and no default schedule."""
-    return SimpleNamespace(diffusion_attention_schedule=SimpleNamespace(profiles={"sparse": object()}, default=None))
+def _scheduled_od_config(default=None, **fields):
+    """Service config with one prepared profile, an optional default schedule and any further config fields."""
+    return SimpleNamespace(
+        diffusion_attention_schedule=SimpleNamespace(profiles={"sparse": object()}, default=default),
+        **fields,
+    )
 
 
 def test_forward_checks_the_attention_schedule_against_the_actual_step_count():
-    """AE4: the distilled table's four steps bound the schedule; num_inference_steps is omitted."""
+    """The distilled table's four steps bound the schedule; num_inference_steps is omitted."""
     from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
 
     diffuse_calls: list[dict[str, Any]] = []
@@ -1165,8 +1168,25 @@ def test_prepare_encode_checks_the_attention_schedule_before_any_step():
         pipeline.prepare_encode(state)
 
 
+def test_prepare_encode_rejects_latent_refine_under_an_attention_schedule():
+    """Step mode rejects latent_refine in prepare_encode with its own client error, before the schedule checks."""
+    from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
+    from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.errors import OmniClientError
+
+    pipeline = _distilled_pipeline([], {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
+    batch = _t2va_batch(num_inference_steps=4, attention_schedule=schedule, extra_args={"latent_refine": 0.5})
+    state = StepRequestState(request_id="refined", prompt=batch.prompts[0], sampling=batch.sampling_params)
+
+    with pytest.raises(OmniClientError, match="step execution does not support latent_refine") as excinfo:
+        pipeline.prepare_encode(state)
+    assert not isinstance(excinfo.value, InvalidAttentionScheduleError)
+
+
 def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit():
-    """KTD6: a schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
+    """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
     from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
 
     diffuse_calls: list[dict[str, Any]] = []
@@ -1184,11 +1204,123 @@ def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit():
     assert prepared == []
     assert diffuse_calls == []
 
-    # Without a schedule, or with the request disabling it, Cache-DiT is prepared as before.
+    # Without a schedule, or with the request disabling it, Cache-DiT is prepared.
     pipeline.forward(_t2va_batch(num_inference_steps=4))
     pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[]))
     assert prepared == [cache_spec, cache_spec]
     assert len(diffuse_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "server_schedule, request_schedule, server_refine, request_refine",
+    [
+        (False, True, False, True),
+        (True, False, False, True),
+        (False, True, True, False),
+        (True, False, True, False),
+    ],
+    ids=[
+        "request-schedule-request-refine",
+        "server-schedule-request-refine",
+        "request-schedule-server-refine",
+        "server-schedule-server-refine",
+    ],
+)
+def test_forward_rejects_an_attention_schedule_with_latent_refine(
+    server_schedule, request_schedule, server_refine, request_refine
+):
+    """A resolved schedule and a resolved latent_refine are rejected before any denoise call.
+
+    Either value can come from the request or from the server default.
+    """
+    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config(
+        default=(AttentionScheduleRange(0, 2, "sparse"),) if server_schedule else None,
+        additional_config={"latent_refine": 0.5} if server_refine else {},
+    )
+    batch = _t2va_batch(
+        num_inference_steps=4,
+        attention_schedule=[{"start": 0, "end": 2, "profile": "sparse"}] if request_schedule else None,
+        extra_args={"latent_refine": 0.5} if request_refine else None,
+    )
+
+    with pytest.raises(InvalidAttentionScheduleError, match="cannot be combined with MiniMax H3 latent_refine"):
+        pipeline.forward(batch)
+    assert diffuse_calls == []
+
+
+def test_forward_runs_latent_refine_when_the_request_disables_the_attention_schedule():
+    """attention_schedule=[] turns off the server default, so latent_refine runs its second denoise call."""
+    from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
+    from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
+
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config(default=(AttentionScheduleRange(0, 2, "sparse"),))
+
+    pipeline.forward(_t2va_batch(num_inference_steps=4, attention_schedule=[], extra_args={"latent_refine": 0.5}))
+
+    # The first call is the main pass; the second re-denoises its result under the refine spec.
+    assert [call.get("refine") for call in diffuse_calls] == [None, MiniMaxH3LatentRefineSpec(strength=0.5)]
+    assert "init_latents" not in diffuse_calls[0]
+    assert "init_latents" in diffuse_calls[1]
+
+
+def test_forward_runs_an_attention_schedule_when_the_request_turns_latent_refine_off():
+    """latent_refine=false opts out of the server default, so the schedule is allowed and one pass runs."""
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config(additional_config={"latent_refine": 0.5})
+    schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
+
+    pipeline.forward(
+        _t2va_batch(num_inference_steps=4, attention_schedule=schedule, extra_args={"latent_refine": False})
+    )
+
+    assert len(diffuse_calls) == 1
+    assert "refine" not in diffuse_calls[0]
+
+
+def test_forward_keeps_an_attention_schedule_with_latent_upscale_alone():
+    """latent_upscale without latent_refine adds no denoise call, so a schedule stays allowed."""
+    diffuse_calls: list[dict[str, Any]] = []
+    upscale_targets: list[Any] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    pipeline.latent_upscaler = SimpleNamespace(
+        upscale=lambda latent, target: _append_and_return(upscale_targets, target, latent)
+    )
+    schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
+
+    pipeline.forward(
+        _t2va_batch(num_inference_steps=4, attention_schedule=schedule, extra_args={"latent_upscale": 2.0})
+    )
+
+    assert len(diffuse_calls) == 1
+    assert "refine" not in diffuse_calls[0]
+    # The 1344x768 request is 84x48 latent cells; the upscaler ran once on the 2x target.
+    assert [(target.latent_width, target.latent_height) for target in upscale_targets] == [(168, 96)]
+
+
+def test_forward_reports_an_invalid_latent_refine_value_under_an_attention_schedule():
+    """An invalid latent_refine value keeps the resolver's own client error under a schedule."""
+    from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
+    from vllm_omni.errors import OmniClientError
+
+    diffuse_calls: list[dict[str, Any]] = []
+    pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
+    pipeline.od_config = _scheduled_od_config()
+    schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
+
+    with pytest.raises(OmniClientError, match="latent_refine must be a number or an object") as excinfo:
+        pipeline.forward(
+            _t2va_batch(num_inference_steps=4, attention_schedule=schedule, extra_args={"latent_refine": True})
+        )
+    assert not isinstance(excinfo.value, InvalidAttentionScheduleError)
+    assert diffuse_calls == []
 
 
 def test_absent_base_schedule_key_differs_from_an_empty_list():

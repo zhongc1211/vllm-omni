@@ -1409,7 +1409,7 @@ class OmniDiffusionConfig:
         self.diffusion_attention_config = build_attention_config(self.diffusion_attention_config)
         self.diffusion_attention_schedule = parse_attention_schedule_config(self.diffusion_attention_schedule)
         if self.diffusion_attention_schedule is not None and self.diffusion_compile_granularity == "full":
-            # KTD7: scheduled attention layers call an eager boundary while compiling. Its compile tests
+            # Scheduled attention layers call an eager boundary while compiling. Its compile tests
             # use regional compilation, where each block is its own frame; with 'full' the boundary's graph
             # break falls inside the block loop of the transformer's frame, which they do not cover.
             raise ValueError(
@@ -1525,7 +1525,7 @@ class OmniDiffusionConfig:
 
         cfg = getattr(self, "diffusion_attention_config", None)
         schedule = getattr(self, "diffusion_attention_schedule", None)
-        # KTD8: one shared rule for which specs can carry calibration - the baseline plus every
+        # One shared rule for which specs can carry calibration - the baseline plus every
         # schedule profile - so a profile the service default never references cannot keep an
         # undetected target_sparsity-without-calibration gap. The loader's calibration discovery
         # calls the same helper. No schedule -> specs are exactly the baseline specs.
@@ -2287,7 +2287,7 @@ def parse_attention_schedule_config(
     """Normalize service config without initializing backends or reading env vars.
 
     A config without profiles can never select a candidate (its default must then be empty), so it
-    is returned as None: no schedule, and no compile boundary on the attention layers (KTD7).
+    is returned as None: no schedule, and no compile boundary on the attention layers.
     """
     if value is None:
         return None

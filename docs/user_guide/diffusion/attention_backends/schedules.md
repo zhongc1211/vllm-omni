@@ -15,7 +15,8 @@ This guide uses two more terms:
 - A **schedule** is the list of ranges that applies to a request.
 - The **base configuration** is the attention configuration that the server
   resolves without a schedule: `--diffusion-attention-config`,
-  `--diffusion-attention-backend`, `DIFFUSION_ATTENTION_BACKEND`, or the
+  `--diffusion-attention-backend`, the environment variables
+  `DIFFUSION_ATTENTION_BACKEND` and `DIFFUSION_ATTENTION_QUANT`, or the
   platform default. Steps that no range covers use the base configuration; see
   the [attention backend overview](../attention_backends.md#configuration).
 
@@ -79,10 +80,11 @@ and `per_role` keys as `--diffusion-attention-config` and uses the same
 - A profile does not inherit from the base configuration. `per_role` entries
   of the base configuration are not carried into a profile. A role that the
   profile does not cover uses the platform default, not the base backend.
-- `--diffusion-attention-backend`, `DIFFUSION_ATTENTION_BACKEND`, and
-  `--fastvideo-vsa-topk` do not apply to profiles. A `FASTVIDEO_VSA` profile
-  sets `fastvideo_vsa_topk` in its own spec, for example
-  `{"backend": "FASTVIDEO_VSA", "fastvideo_vsa_topk": 64}`.
+- `--diffusion-attention-backend`, `DIFFUSION_ATTENTION_BACKEND`,
+  `DIFFUSION_ATTENTION_QUANT`, and `--fastvideo-vsa-topk` do not apply to
+  profiles. A `FASTVIDEO_VSA` profile sets `fastvideo_vsa_topk` in its own
+  spec, for example `{"backend": "FASTVIDEO_VSA", "fastvideo_vsa_topk": 64}`.
+  A profile that uses quantization sets `quant` in its own spec.
 - A profile name starts with an ASCII letter and continues with ASCII letters,
   digits, `_`, or `-`.
 - Every profile is prepared and validated at startup on every attention layer
@@ -141,7 +143,10 @@ Each range is an object with exactly three keys:
   classifier-free guidance, both evaluations of a step use the same profile.
 - A pipeline that runs several denoising sequences in one request applies the
   schedule to each sequence from step 0. This covers each Wan2.2 S2V clip,
-  and each MiniMax-H3 output seed and continuation window.
+  and each MiniMax-H3 output seed and continuation window. A MiniMax-H3
+  `latent_refine` pass is a second sequence with its own step count, and a
+  request cannot combine it with a non-empty schedule; see
+  [Compatibility limits](#compatibility-limits).
 - The schedule is active only inside the denoising loop. Attention calls
   outside it, for example during prompt encoding or decoding, use the base
   configuration.
@@ -341,10 +346,16 @@ The response depends on where the error is detected. On the HTTP endpoints:
 - A malformed schedule or an undeclared profile returns HTTP 400 with the
   message in the JSON error body.
 - A range that does not fit is detected when the pipeline builds its timestep
-  sequence. In step mode the response is HTTP 400. In request mode, a request
-  that runs alone in its batch currently receives an HTTP 5xx response whose
-  text contains the message. That is every request on MiniMax-H3 and
-  HunyuanImage-3.0, and every request on Wan2.2 when `--max-num-seqs` is 1.
+  sequence. In step mode the response is HTTP 400. In request mode the
+  response is currently an HTTP 5xx whose text contains the message, with one
+  exception: on the in-process executor, a request that shares its batch with
+  another request receives HTTP 400. The in-process executor is the default
+  for a diffusion stage with one GPU. A stage with more than one GPU, or with
+  `distributed_executor_backend: mp`, uses the multi-process executor, which
+  returns the 5xx for any batch size. Bundled deploy files such as
+  `wan2_2_ti2v.yaml` set `distributed_executor_backend: mp`. MiniMax-H3 and
+  HunyuanImage-3.0 do not batch requests in request mode, so the exception
+  applies only to Wan2.2 with `--max-num-seqs` above 1.
 - `POST /v1/videos` creates the job first, so these errors appear on the job
   record and not in the response to the `POST`.
 
@@ -364,6 +375,7 @@ them.
 | `--diffusion-compile-granularity full` | Rejected at startup. Use regional scope, which is the default. |
 | Cache backends (`--cache-backend`) | Rejected at startup, including when the default ranges are empty. |
 | MiniMax-H3 request-scoped Cache-DiT | In request mode, a request with `quality=high` whose schedule is non-empty is rejected before denoising. This includes a schedule inherited from the server's default ranges. The response is currently an HTTP 5xx whose text contains `attention_schedule cannot be combined with MiniMax H3 Cache-DiT`. Send `quality=lossless` or `"attention_schedule": []`. In step mode, `quality=high` is rejected with HTTP 400 for every request, with or without a schedule. See [Request-Scoped Quality](../cache_acceleration/cache_dit.md#request-scoped-quality-minimax-h3). |
+| MiniMax-H3 `latent_refine` | In request mode, a request with `latent_refine` whose schedule is non-empty is rejected before denoising. This includes a schedule inherited from the server's default ranges and a `latent_refine` value inherited from `--additional-config`. A server that sets both non-empty default ranges and a `latent_refine` default therefore rejects every request that overrides neither. The response is currently an HTTP 5xx whose text contains `attention_schedule cannot be combined with MiniMax H3 latent_refine`. Send `"attention_schedule": []` or `"latent_refine": false`. `latent_upscale` without `latent_refine` is accepted with a schedule. In step mode, `latent_refine` is rejected with HTTP 400 for every request, with or without a schedule. See [Latent super-resolution](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#latent-super-resolution) in the MiniMax-H3 recipe. |
 | Sequence parallelism on a model that pads the sequence | Applies to Ulysses, Ring, and AllGather-KV on Wan2.2 and HunyuanImage-3.0. MiniMax-H3 declares no sequence-parallel padding, so this check does not apply to it; its packed-sequence padding has its own limit, listed below the table. Every profile must select a backend with attention-mask support on every attention layer of the transformer, including cross-attention. The check runs at startup and does not depend on the request shape. The backends are listed below the table. |
 | Ring sequence parallelism | On layers that take part in sequence parallelism, a profile must not set `skip_softmax`. It must also resolve to the same backend as the base configuration, selected the same way (named explicitly in both, or left to the platform default in both), with the same backend options. A schedule therefore cannot change attention on those layers. |
 | AllGather-KV sequence parallelism | On layers that take part in sequence parallelism, a profile that resolves to `TRTLLM_ATTN` is rejected at startup, as for the base configuration. A `RAINFUSION_ATTN` profile with sparsity above 0 (the default is 0.8) is rejected on every layer that selects it. |
@@ -371,6 +383,11 @@ them.
 | KV-cache quantization (`--diffusion-kv-cache-dtype`) | On each layer that quantizes its KV cache, every profile's backend must support the configured dtype on the platform. `auto` and `float` add no requirement. |
 | Model-owned attention kernels | A layer that uses a model-owned kernel instead of a backend rejects schedule profiles at startup. |
 | `target_sparsity` in a `TRTLLM_ATTN` profile | Requires a calibration curve for each attention layer that the checkpoint's calibration does not list under `ignore`. Without one, startup fails; use `threshold`. |
+
+When the base configuration takes its `quant` options from
+`DIFFUSION_ATTENTION_QUANT`, a profile must repeat the same `quant` options in
+its own spec to pass the ring and paged KV checks in the table, because the
+variable does not apply to profiles.
 
 The backends with attention-mask support are `TORCH_SDPA`, `FLASH_ATTN`,
 `CUDNN_ATTN`, `FLASH_ATTN_HUB`, `FLASH_ATTN_3_HUB`, and `FLASHINFER_ATTN` when
@@ -403,8 +420,9 @@ fallbacks still apply. For example:
 - Skip-Softmax stays dense, without a log line, on steps whose normalized
   timestep is above `disabled_until_timestep`. With `target_sparsity`, it also
   stays dense on the layers that the calibration lists under `ignore`.
-- [TRTLLM SAGE](trtllm.md#sage-quantization) runs a call dense when a KV
-  sequence is shorter than `k_block_size`, and logs a warning once.
+- On a causal attention layer, `TRTLLM_ATTN` turns
+  [SAGE](trtllm.md#sage-quantization) off when the layer is built and logs
+  nothing. A profile that sets `quant` runs that layer without SAGE.
 - On CUDA, `FASTVIDEO_VSA` falls back to SDPA when its preconditions are not
   met or its kernel raises, and logs
   `FASTVIDEO_VSA falling back to SDPA: <reason>` once. On NPU, XPU, and MUSA
@@ -426,7 +444,7 @@ such as projections and normalization, stays compiled. See
 - The eager attention call applies to every request on a server that
   configures profiles. This includes requests that send
   `"attention_schedule": []` and servers whose default ranges are empty. A
-  server without profiles compiles attention as before.
+  server without profiles does not make this eager call.
 - **Wan2.2**: the attention calls inside each compiled transformer block run
   eagerly.
 - **MiniMax-H3**: packed attention already runs outside the compiled block

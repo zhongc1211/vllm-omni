@@ -468,7 +468,7 @@ def _sparse_schedule():
 
 
 def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
-    """KTD5: under a bound schedule, each request selects attention at its own step and total."""
+    """Under a bound schedule, each request selects attention at its own step and total."""
     from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
 
@@ -512,7 +512,7 @@ def test_scheduled_step_batch_restores_progress_when_a_request_forward_raises():
 
 @pytest.mark.parametrize("schedule", [None, ()], ids=["unbound", "disabled"])
 def test_unscheduled_mixed_step_batch_keeps_one_packed_forward(schedule):
-    """R9: without a non-empty bound schedule, the batch runs as it did before schedules existed."""
+    """Without a non-empty bound schedule, both requests share one packed forward that publishes no step."""
     from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_forward_context
 
     model = _ProgressRecordingModel()
@@ -802,7 +802,7 @@ def _candidate_rejections(attention, record) -> list[str]:
 
 
 def test_dit_attention_registers_schedule_candidate_checks(monkeypatch):
-    """KTD6: startup rejects candidates the DiT cannot run, instead of the first scheduled forward."""
+    """Startup rejects candidates the DiT cannot run, instead of the first scheduled forward."""
     from tests.diffusion.models.minimax_h3.test_minimax_h3_quantization import _FakeLinear, _small_od_config
     from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
 

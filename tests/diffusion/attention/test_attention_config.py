@@ -204,7 +204,7 @@ class TestAttentionScheduleConfig:
         ids=["empty", "no-profiles", "no-profiles-empty-default", "json", "typed"],
     )
     def test_schedule_without_profiles_is_no_schedule(self, raw):
-        # KTD7: no schedule adds no compile boundary; a config that can select nothing is no schedule.
+        # No schedule adds no compile boundary; a config that can select nothing is no schedule.
         assert parse_attention_schedule_config(raw) is None
         assert OmniDiffusionConfig(diffusion_attention_schedule=raw).diffusion_attention_schedule is None
 
@@ -283,8 +283,9 @@ class TestAttentionScheduleConfig:
         assert parse_attention_schedule_config(json.dumps(raw)) == parse_attention_schedule_config(raw)
 
     def test_schedule_profiles_reject_full_compile_granularity(self):
-        # KTD7's eager boundary is tested under regional compilation only, so config creation rejects
-        # profiles with 'full', as it rejects 'full' with HSDP, sequence parallelism or offload.
+        # The eager boundary that scheduled attention layers call while compiling is tested under
+        # regional compilation only, so config creation rejects profiles with 'full', as it rejects
+        # 'full' with HSDP, sequence parallelism or offload.
         raw = {"profiles": {"dense": {"default": "TORCH_SDPA"}}}
         with pytest.raises(ValueError, match="'full' is incompatible with diffusion_attention_schedule"):
             OmniDiffusionConfig(diffusion_attention_schedule=raw, diffusion_compile_granularity="full")

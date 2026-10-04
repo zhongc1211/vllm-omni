@@ -253,7 +253,7 @@ def test_vace_diffuse_publishes_schedule_total_and_clears_after_loop(scheduled: 
     total = 3 if scheduled else None
     # The expert changes at the numeric boundary (600); the step index still counts every step.
     assert calls == [("high", 0, total, scheduled), ("low", 1, total, scheduled), ("low", 2, total, scheduled)]
-    # Without a schedule the last step stays published after the loop, as before.
+    # Without a schedule the last step stays published after the loop.
     assert after == ((None, None, False) if scheduled else (2, None, False))
 
 

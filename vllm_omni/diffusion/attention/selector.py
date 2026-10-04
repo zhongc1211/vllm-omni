@@ -200,11 +200,11 @@ def resolve_capability_backends(
 ) -> list[tuple[str, type[AttentionBackend], AttentionSpec | None]]:
     """Every backend a capability probe must hold for: the baseline plus every explicit profile.
 
-    A static probe such as SequenceParallel auto-pad runs before Attention layers exist, and
-    with a step schedule the runtime may later switch to a prepared candidate (KTD4). A probe
-    that reads only the baseline config can therefore approve a layout that the selected
-    candidate cannot execute, which KTD6 requires rejecting up front instead of in the first
-    kernel.
+    A static probe such as SequenceParallel auto-pad runs at pad time and reads only the config,
+    not the Attention layers, and with a step schedule the runtime may later switch to a prepared
+    candidate. A probe that reads only the baseline config can therefore approve a layout that the
+    selected candidate cannot execute, which has to be rejected by the probe instead of in the
+    first kernel.
 
     Profiles come back in sorted name order, matching ``Attention._schedule_profiles``, and each
     entry carries its own resolved spec so the probe asks the same question the prepared
@@ -216,9 +216,9 @@ def resolve_capability_backends(
     promoted at construction (marked-paged -> FLASH_ATTN), so this probe cannot speak for the
     candidate that will actually be prepared. And the probe answers for the ``role`` it is given -
     the SequenceParallel auto-pad caller passes ``role="self"`` - so per-role candidates are judged
-    by the post-load KTD6 traversal, which reads each prepared record's own ``backend_cls`` and
-    ``spec``. That traversal is the authoritative per-layer check; this probe is a coarse pre-filter
-    that runs before Attention layers exist.
+    by the post-load startup traversal (``validate_attention_schedule_candidates``), which reads
+    each prepared record's own ``backend_cls`` and ``spec``. That traversal is the authoritative
+    per-layer check; this probe is a coarse pad-time check that reads only the config.
     """
     spec = None
     if attention_config is not None:
