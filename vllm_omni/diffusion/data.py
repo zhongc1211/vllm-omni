@@ -1012,6 +1012,9 @@ class OmniDiffusionConfig:
     # Worker extension class for custom functionality
     worker_extension_cls: str | None = None
 
+    # Internal transport of explicit stage runtime.env to remote Ray actors.
+    ray_worker_env: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+
     # Custom pipeline arguments for custom pipelines
     custom_pipeline_args: dict[str, Any] | None = None
 
@@ -2263,6 +2266,7 @@ class AttentionScheduleConfig:
 
     profiles: dict[str, AttentionConfig] = field(default_factory=dict)
     default: AttentionSchedule = ()
+    sigma: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.profiles, Mapping):
@@ -2279,6 +2283,16 @@ class AttentionScheduleConfig:
             raise TypeError("diffusion_attention_schedule.default must be a list of ranges, not None")
         validate_attention_schedule(default, profiles=self.profiles)
         self.default = default
+        from vllm_omni.diffusion.attention.schedule import (
+            parse_attention_sigma_schedule,
+            validate_attention_sigma_schedule,
+        )
+
+        sigma = parse_attention_sigma_schedule(self.sigma)
+        if sigma is None:
+            raise TypeError("diffusion_attention_schedule.sigma must be a list of windows, not None")
+        validate_attention_sigma_schedule(sigma, profiles=self.profiles)
+        self.sigma = sigma
 
 
 def parse_attention_schedule_config(
@@ -2294,7 +2308,7 @@ def parse_attention_schedule_config(
     if isinstance(value, str):
         value = json.loads(value)
     if isinstance(value, AttentionScheduleConfig):
-        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default)
+        config = AttentionScheduleConfig(profiles=value.profiles, default=value.default, sigma=value.sigma)
     elif isinstance(value, Mapping):
         config = AttentionScheduleConfig(**dict(value))
     else:

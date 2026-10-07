@@ -153,6 +153,15 @@ Each range is an object with exactly three keys:
   outside it, for example during prompt encoding or decoding, use the base
   configuration.
 
+A sigma schedule uses the same profiles and selects by the normalized noise
+value published as the denoise timestep, descending from 1 to 0. A window is
+`{"low": 0.0, "high": 0.3, "profile": "sparse"}` and includes both ends. `None`
+inherits the service windows, `[]` disables them, and an explicit list replaces
+them. A request cannot send both a non-empty step schedule and a non-empty
+sigma schedule. Request mode and step mode resolve the batch before denoising.
+If the timestep is missing while a sigma schedule is active, attention fails
+instead of using the base backend.
+
 Range boundaries are step indices. The Skip-Softmax key
 `disabled_until_timestep` is a separate control that compares the normalized
 timestep; see [Timestep gating](trtllm.md#timestep-gating). When a profile

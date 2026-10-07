@@ -14,7 +14,7 @@ import copy
 import gc
 import time
 from collections.abc import Callable, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
@@ -27,9 +27,11 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.attention.schedule import (
     AttentionSchedule,
+    reject_mixed_attention_schedules,
     require_denoise_progress_publisher,
     require_no_cache_backend,
     resolve_batch_attention_schedule,
+    resolve_batch_attention_sigma_schedule,
 )
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
@@ -48,7 +50,11 @@ from vllm_omni.diffusion.diffusion_kv.paged_attention_adapter import (
     DiffusionPagedAttentionRow,
 )
 from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_guidance_rank
-from vllm_omni.diffusion.forward_context import bind_attention_schedule, set_forward_context
+from vllm_omni.diffusion.forward_context import (
+    bind_attention_schedule,
+    bind_attention_sigma_schedule,
+    set_forward_context,
+)
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
 from vllm_omni.diffusion.interaction.types import InteractionPayload
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
@@ -163,11 +169,20 @@ def _normalize_pipeline_outputs(
     return outputs
 
 
-def _attention_schedule_scope(schedule: AttentionSchedule) -> AbstractContextManager[Any]:
-    """Bind a non-empty schedule; an unscheduled batch leaves the forward context untouched."""
-    if not schedule:
+def _attention_schedule_scope(schedule: AttentionSchedule, sigma_schedule=()) -> AbstractContextManager[Any]:
+    """Bind non-empty step and sigma schedules; an unscheduled batch leaves the context untouched."""
+    reject_mixed_attention_schedules(schedule, sigma_schedule)
+
+    @contextmanager
+    def _bound():
+        step_scope = bind_attention_schedule(schedule) if schedule else nullcontext()
+        sigma_scope = bind_attention_sigma_schedule(sigma_schedule, denoise=True) if sigma_schedule else nullcontext()
+        with step_scope, sigma_scope:
+            yield
+
+    if not schedule and not sigma_schedule:
         return nullcontext()
-    return bind_attention_schedule(schedule)
+    return _bound()
 
 
 class DiffusionModelRunner(DiffusionStagePayloadMixin):
@@ -826,8 +841,10 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         if require_request_batch_support and not getattr(self.pipeline, "supports_request_batch", False):
             raise RuntimeError(f"{type(self.pipeline).__name__} does not support request-batch forward.")
         attention_schedule = resolve_batch_attention_schedule(reqs, od_config)
-        require_denoise_progress_publisher(self.pipeline, attention_schedule)
-        require_no_cache_backend(od_config, attention_schedule)
+        sigma_schedule = resolve_batch_attention_sigma_schedule(reqs, od_config)
+        reject_mixed_attention_schedules(attention_schedule, sigma_schedule)
+        require_denoise_progress_publisher(self.pipeline, attention_schedule or sigma_schedule)
+        require_no_cache_backend(od_config, attention_schedule or sigma_schedule)
 
         # Use no_grad() for HSDP compatibility, inference_mode() otherwise for
         # better perf. HSDP2's fully_shard pre-forward hooks need tensor version
@@ -908,7 +925,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     [getattr(req, "cancellation_signal", None) for req in reqs],
                     enabled=getattr(self.pipeline, "supports_request_cancellation", False) is True,
                 ),
-                _attention_schedule_scope(attention_schedule),
+                _attention_schedule_scope(attention_schedule, sigma_schedule),
             ):
                 with record_function(record_name):
                     try:
@@ -1428,7 +1445,9 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             states, new_request_ids = self._update_states(scheduler_output)
             # Reject before pre-encode, so a scheduled request never starts on a pipeline without progress.
             attention_schedule = resolve_batch_attention_schedule(states, self.od_config)
-            require_denoise_progress_publisher(pipeline, attention_schedule)
+            sigma_schedule = resolve_batch_attention_sigma_schedule(states, self.od_config)
+            reject_mixed_attention_schedules(attention_schedule, sigma_schedule)
+            require_denoise_progress_publisher(pipeline, attention_schedule or sigma_schedule)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
@@ -1453,7 +1472,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 in_diffusion_kv_memory_profile=in_diffusion_kv_memory_profile,
             ):
                 clear_pipeline_stage_durations(pipeline)
-                with _attention_schedule_scope(attention_schedule):
+                with _attention_schedule_scope(attention_schedule, sigma_schedule):
                     noise_pred = pipeline.denoise_step(input_batch, states=states)
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:

@@ -55,6 +55,8 @@ class ForwardContext:
     # selects prepared profiles only while attention_schedule_denoise_active is set.
     attention_schedule: tuple[Any, ...] | None = None
     attention_schedule_denoise_active: bool = False
+    attention_sigma_schedule: tuple[Any, ...] | None = None
+    attention_sigma_schedule_active: bool = False
     # Per-request reference latent for img2img DiT models (e.g. Ming)
     ref_latent: torch.Tensor | None = None
     # Per-request projected direct-VLM condition (e.g., Ming-Image). For now for bsz 1.
@@ -313,6 +315,22 @@ def bind_attention_schedule(schedule: tuple[Any, ...] | None, *, denoise: bool =
         _forward_context.attention_schedule_denoise_active = previous_denoise
 
 
+@contextmanager
+def bind_attention_sigma_schedule(schedule: tuple[Any, ...] | None, *, denoise: bool = False):
+    """Install one sigma-window schedule and restore the previous context on any exit."""
+    if _forward_context is None:
+        raise RuntimeError("bind_attention_sigma_schedule requires an active forward context")
+    previous_schedule = _forward_context.attention_sigma_schedule
+    previous_active = _forward_context.attention_sigma_schedule_active
+    _forward_context.attention_sigma_schedule = None if schedule is None else tuple(schedule)
+    _forward_context.attention_sigma_schedule_active = denoise
+    try:
+        yield
+    finally:
+        _forward_context.attention_sigma_schedule = previous_schedule
+        _forward_context.attention_sigma_schedule_active = previous_active
+
+
 def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
     """Set the current diffusion denoise step on the active ForwardContext."""
     if _forward_context is not None:
@@ -321,6 +339,10 @@ def set_forward_context_denoise_step_idx(step_idx: int | None) -> None:
             _forward_context.attention_schedule_denoise_active = True
         elif step_idx is None:
             _forward_context.attention_schedule_denoise_active = False
+        if step_idx is not None and getattr(_forward_context, "attention_sigma_schedule", None):
+            _forward_context.attention_sigma_schedule_active = True
+        elif step_idx is None:
+            _forward_context.attention_sigma_schedule_active = False
         if step_idx is not None:
             paged_kv_runtime = getattr(_forward_context, "paged_kv_runtime", None)
             ensure_active = getattr(paged_kv_runtime, "ensure_active", None)
