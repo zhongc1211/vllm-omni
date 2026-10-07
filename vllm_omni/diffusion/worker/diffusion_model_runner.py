@@ -33,6 +33,7 @@ from vllm_omni.diffusion.attention.schedule import (
     resolve_batch_attention_schedule,
     resolve_batch_attention_sigma_schedule,
 )
+from vllm_omni.diffusion.attention.sigma_graphs import enable_sigma_attention_graphs
 from vllm_omni.diffusion.cache.cachedit import CacheDiTBackend, cache_summary
 from vllm_omni.diffusion.cache.prompt_embed_cache import (
     install_prompt_embed_cache,
@@ -282,12 +283,16 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
+        explicit_attention_graphs = enable_sigma_attention_graphs(model, self.od_config, self.device)
+        # Attention graphs are replayed from the attention-schedule eager boundary. Do not wrap
+        # that explicit capture in compiler-managed CUDA graphs.
+        compile_options = {"options": {"triton.cudagraphs": False}} if explicit_attention_graphs else {}
         try:
             if compile_granularity == "full":
-                model.compile(dynamic=compile_dynamic)
+                model.compile(dynamic=compile_dynamic, **compile_options)
                 compiled_model = model
             else:
-                compiled_model = regionally_compile(model, dynamic=compile_dynamic)
+                compiled_model = regionally_compile(model, dynamic=compile_dynamic, **compile_options)
             setattr(self.pipeline, attr_name, compiled_model)
         except Exception as e:
             logger.warning(
