@@ -316,6 +316,20 @@ def resolve_attention_sigma_schedule(
     return schedule
 
 
+def normalized_sigma(current: float, reference: float = 1.0) -> float:
+    """Normalize scheduler noise; flow-matching sigma already uses reference=1."""
+    import math
+
+    if isinstance(current, bool) or isinstance(reference, bool):
+        raise TypeError("normalized sigma inputs must be numbers")
+    current, reference = float(current), float(reference)
+    if not math.isfinite(reference) or reference <= 0:
+        raise ValueError("normalized sigma reference must be finite and positive")
+    value = current / reference
+    _validate_sigma(value, "sigma")
+    return value
+
+
 def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: float) -> str | None:
     """Return the selected name, or None when the normalized sigma is in a gap."""
     _validate_sigma(sigma, "sigma")

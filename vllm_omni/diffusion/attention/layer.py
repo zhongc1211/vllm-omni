@@ -924,9 +924,9 @@ class Attention(nn.Module):
         if step_active and sigma_active:
             raise RuntimeError("a request cannot combine attention_schedule with attention_sigma_schedule")
         if sigma_active:
-            sigma = getattr(ctx, "denoise_timestep", None)
+            sigma = getattr(ctx, "denoise_sigma", None)
             if sigma is None:
-                raise RuntimeError("active sigma attention schedule requires denoise_timestep")
+                raise RuntimeError("active sigma attention schedule requires denoise_sigma")
             from vllm_omni.diffusion.attention.schedule import select_attention_profile_by_sigma
 
             name = select_attention_profile_by_sigma(sigma_schedule, sigma)

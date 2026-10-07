@@ -590,7 +590,14 @@ class Wan22Pipeline(
         with self.progress_bar(total=len(timesteps)) as pbar:
             for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
-                self.record_denoise_step(step_idx, t, total_steps=total_steps)
+                self.record_denoise_step(
+                    step_idx,
+                    t,
+                    total_steps=total_steps,
+                    # DMD bypasses set_timesteps; its fixed flow timesteps are
+                    # sigma * num_train_timesteps, not scheduler.sigmas.
+                    normalized_sigma=float(t) / self.scheduler.config.num_train_timesteps if self.is_dmd else None,
+                )
 
                 # Select model based on timestep and boundary_ratio
                 # High noise stage (t >= boundary_timestep): use transformer
