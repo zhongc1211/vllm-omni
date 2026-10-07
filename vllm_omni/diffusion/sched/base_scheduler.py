@@ -49,6 +49,7 @@ BatchSamplingParamsKey = StepBatchSamplingParamsKey | RequestBatchSamplingParams
 # they must be resolved separately from the bulk lookup.
 _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES = frozenset(field.name for field in fields(StepBatchSamplingParamsKey)) - {
     "attention_schedule",
+    "attention_sigma_schedule",
     "condition_key",
     "lora_int_id",
     "use_step_execution",
@@ -746,7 +747,7 @@ class BaseScheduler(ABC):
         sampling = request.sampling_params
         # LoRA identity is optional on sampling params (and on test stubs).
         lora_request = getattr(sampling, "lora_request", None)
-        from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
+        from vllm_omni.diffusion.attention.schedule import parse_attention_schedule, parse_attention_sigma_schedule
 
         key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
         attention_schedule = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
@@ -755,6 +756,9 @@ class BaseScheduler(ABC):
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
             attention_schedule=attention_schedule,
+            attention_sigma_schedule=parse_attention_sigma_schedule(
+                getattr(sampling, "attention_sigma_schedule", None)
+            ),
             **key_kwargs,
         )
 

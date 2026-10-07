@@ -53,6 +53,7 @@ from vllm_omni.diffusion.distributed.parallel_state import get_classifier_free_g
 from vllm_omni.diffusion.forward_context import (
     bind_attention_schedule,
     bind_attention_sigma_schedule,
+    request_denoise_progress,
     set_forward_context,
 )
 from vllm_omni.diffusion.interaction.coordinator import InteractionCoordinator
@@ -176,7 +177,7 @@ def _attention_schedule_scope(schedule: AttentionSchedule, sigma_schedule=()) ->
     @contextmanager
     def _bound():
         step_scope = bind_attention_schedule(schedule) if schedule else nullcontext()
-        sigma_scope = bind_attention_sigma_schedule(sigma_schedule, denoise=True) if sigma_schedule else nullcontext()
+        sigma_scope = bind_attention_sigma_schedule(sigma_schedule) if sigma_schedule else nullcontext()
         with step_scope, sigma_scope:
             yield
 
@@ -1297,6 +1298,33 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
         self.input_batch = input_batch
         return prepared_states, input_batch, error_outputs
 
+    def _denoise_sigma_batch(self, input_batch: InputBatch, states: list[StepRequestState]) -> torch.Tensor | None:
+        """Isolate scheduled noise trajectories before a pipeline can pack them.
+
+        Even identical windows can select different profiles at the same step.
+        Scheduler keys only know configuration, not model-private trajectories.
+        Conservatively run one request per forward, including equal-profile
+        requests whose selected backend may not isolate packed documents.
+        """
+        pipeline = self.pipeline
+        assert pipeline is not None
+        if len(states) <= 1:
+            return pipeline.denoise_step(input_batch, states=states)
+        predictions = []
+        for state in states:
+            # Do not reuse the main batch buffer: the runner still needs its
+            # original composition when scattering updated latents.
+            single = InputBatch.make_batch([state])
+            with request_denoise_progress(state.step_index, state.total_steps):
+                predictions.append(pipeline.denoise_step(single, states=[state]))
+            if getattr(pipeline, "interrupt", False):
+                return None
+        if all(pred is None for pred in predictions):
+            return None
+        if any(pred is None for pred in predictions):
+            raise RuntimeError("sigma subbatches returned inconsistent noise predictions")
+        return torch.cat(predictions, dim=0)
+
     def _update_states_after(
         self,
         states: list[StepRequestState],
@@ -1448,6 +1476,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             sigma_schedule = resolve_batch_attention_sigma_schedule(states, self.od_config)
             reject_mixed_attention_schedules(attention_schedule, sigma_schedule)
             require_denoise_progress_publisher(pipeline, attention_schedule or sigma_schedule)
+            require_no_cache_backend(self.od_config, attention_schedule or sigma_schedule)
             is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
             if (
                 record_output_peak_memory
@@ -1473,7 +1502,11 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
             ):
                 clear_pipeline_stage_durations(pipeline)
                 with _attention_schedule_scope(attention_schedule, sigma_schedule):
-                    noise_pred = pipeline.denoise_step(input_batch, states=states)
+                    noise_pred = (
+                        self._denoise_sigma_batch(input_batch, states)
+                        if sigma_schedule
+                        else pipeline.denoise_step(input_batch, states=states)
+                    )
                 denoise_stage_durations = consume_pipeline_stage_durations(pipeline)
                 for state in states:
                     merge_stage_durations(

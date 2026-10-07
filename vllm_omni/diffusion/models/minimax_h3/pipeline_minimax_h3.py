@@ -3289,7 +3289,9 @@ class MiniMaxH3Pipeline(
         ]
         progress = set(request_progress)
         minimax_h3_publish_denoise_progress(*(progress.pop() if len(progress) == 1 else (None, None, None)))
-        scheduled = is_forward_context_available() and bool(getattr(get_forward_context(), "attention_schedule", None))
+        scheduled = is_forward_context_available() and bool(
+            get_forward_context().attention_schedule or get_forward_context().attention_sigma_schedule
+        )
 
         if len(batch_states) > 1 and (
             scheduled or mixed_transformers or not self._packed_batch_supported(transformers[0])
@@ -3342,7 +3344,11 @@ class MiniMaxH3Pipeline(
                 # backend isolates packed requests. The batch-level progress published
                 # above is restored after each forward, including when it raises.
                 step, sigma_video, total_steps = request_progress[index]
-                with request_denoise_progress(step, total_steps, sigma_video) if scheduled else nullcontext():
+                with (
+                    request_denoise_progress(step, total_steps, sigma_video, sigma=sigma_video)
+                    if scheduled
+                    else nullcontext()
+                ):
                     request_video, request_audio = transformers[index](**forward_kwargs)
                 video_parts.append(request_video)
                 audio_parts.append(request_audio)
