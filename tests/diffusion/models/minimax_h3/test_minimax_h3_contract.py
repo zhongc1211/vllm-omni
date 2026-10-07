@@ -1142,8 +1142,16 @@ def _scheduled_od_config(default=None, **fields):
     )
 
 
-def test_forward_checks_the_attention_schedule_against_the_actual_step_count():
+def _allow_cpu_empty_cache(monkeypatch) -> None:
+    """CPU platform objects may leave empty_cache unset; the forward still calls it at stage boundaries."""
+    from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3
+
+    monkeypatch.setattr(pipeline_minimax_h3.current_omni_platform, "empty_cache", lambda: None, raising=False)
+
+
+def test_forward_checks_the_attention_schedule_against_the_actual_step_count(monkeypatch):
     """The distilled table's four steps bound the schedule; num_inference_steps is omitted."""
+    _allow_cpu_empty_cache(monkeypatch)
     from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
 
     diffuse_calls: list[dict[str, Any]] = []
@@ -1189,8 +1197,9 @@ def test_prepare_encode_rejects_latent_refine_under_an_attention_schedule():
     assert not isinstance(excinfo.value, InvalidAttentionScheduleError)
 
 
-def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit():
+def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit(monkeypatch):
     """A schedule is rejected before Cache-DiT is prepared when the quality plan installs it."""
+    _allow_cpu_empty_cache(monkeypatch)
     from vllm_omni.diffusion.attention.schedule import InvalidAttentionScheduleError
 
     diffuse_calls: list[dict[str, Any]] = []
@@ -1260,8 +1269,9 @@ def test_forward_rejects_an_attention_schedule_with_latent_refine(
     assert diffuse_calls == []
 
 
-def test_forward_runs_latent_refine_when_the_request_disables_the_attention_schedule():
+def test_forward_runs_latent_refine_when_the_request_disables_the_attention_schedule(monkeypatch):
     """attention_schedule=[] turns off the server default, so latent_refine runs its second denoise call."""
+    _allow_cpu_empty_cache(monkeypatch)
     from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
     from vllm_omni.diffusion.models.minimax_h3.latent_upscaler import MiniMaxH3LatentRefineSpec
 
@@ -1277,8 +1287,9 @@ def test_forward_runs_latent_refine_when_the_request_disables_the_attention_sche
     assert "init_latents" in diffuse_calls[1]
 
 
-def test_forward_runs_an_attention_schedule_when_the_request_turns_latent_refine_off():
+def test_forward_runs_an_attention_schedule_when_the_request_turns_latent_refine_off(monkeypatch):
     """latent_refine=false opts out of the server default, so the schedule is allowed and one pass runs."""
+    _allow_cpu_empty_cache(monkeypatch)
     diffuse_calls: list[dict[str, Any]] = []
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
     pipeline.od_config = _scheduled_od_config(additional_config={"latent_refine": 0.5})
@@ -1292,8 +1303,9 @@ def test_forward_runs_an_attention_schedule_when_the_request_turns_latent_refine
     assert "refine" not in diffuse_calls[0]
 
 
-def test_forward_keeps_an_attention_schedule_with_latent_upscale_alone():
+def test_forward_keeps_an_attention_schedule_with_latent_upscale_alone(monkeypatch):
     """latent_upscale without latent_refine adds no denoise call, so a schedule stays allowed."""
+    _allow_cpu_empty_cache(monkeypatch)
     diffuse_calls: list[dict[str, Any]] = []
     upscale_targets: list[Any] = []
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
