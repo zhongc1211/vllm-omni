@@ -206,6 +206,12 @@ def test_runner_enabling_is_conservative(monkeypatch, reason):
 
 
 @pytest.mark.cpu
+@pytest.mark.parametrize("device", [None, "cpu"])
+def test_graph_enabling_needs_no_config_for_missing_or_cpu_device(device):
+    assert not enable_sigma_attention_graphs(SimpleNamespace(), SimpleNamespace(), device)
+
+
+@pytest.mark.cpu
 @pytest.mark.parametrize("enabled", [True, False])
 def test_runner_disables_compiler_cudagraphs_only_when_explicit_cache_enabled(monkeypatch, enabled):
     from vllm_omni.diffusion.worker import diffusion_model_runner as runner_mod

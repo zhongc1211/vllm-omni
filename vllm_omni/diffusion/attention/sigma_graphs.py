@@ -334,9 +334,10 @@ def enable_sigma_attention_graphs(model, config, device) -> bool:
     from vllm_omni.diffusion.offloader.config import offload_enabled
 
     if (
-        config.enforce_eager
-        or getattr(config, "diffusion_attention_schedule", None) is None
+        device is None
         or torch.device(device).type != "cuda"
+        or config.enforce_eager
+        or getattr(config, "diffusion_attention_schedule", None) is None
         or not torch.cuda.is_available()
         or torch.version.hip is not None
         or config.parallel_config.use_hsdp

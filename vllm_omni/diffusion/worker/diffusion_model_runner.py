@@ -283,7 +283,7 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
 
         compile_granularity = self.od_config.diffusion_compile_granularity
         compile_dynamic = self.od_config.diffusion_compile_dynamic
-        explicit_attention_graphs = enable_sigma_attention_graphs(model, self.od_config, self.device)
+        explicit_attention_graphs = enable_sigma_attention_graphs(model, self.od_config, getattr(self, "device", None))
         # Attention graphs are replayed from the attention-schedule eager boundary. Do not wrap
         # that explicit capture in compiler-managed CUDA graphs.
         compile_options = {"options": {"triton.cudagraphs": False}} if explicit_attention_graphs else {}
