@@ -2375,9 +2375,8 @@ class HunyuanImage3Pipeline(
             )
         # A bound schedule selects attention from each request's own step and total, so requests
         # run one at a time and the batch-wide backend check, which reads the baseline config, is skipped.
-        scheduled = is_forward_context_available() and bool(
-            get_forward_context().attention_schedule or get_forward_context().attention_sigma_schedule
-        )
+        ctx = get_forward_context() if is_forward_context_available() else None
+        scheduled = bool(getattr(ctx, "attention_schedule", None) or getattr(ctx, "attention_sigma_schedule", None))
         if scheduled:
             groups = [[state] for state in states]
         else:

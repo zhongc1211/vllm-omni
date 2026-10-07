@@ -23,8 +23,8 @@ from tests.diffusion.attention.test_attention_schedule_context import (
 from vllm_omni.diffusion.attention.schedule import resolve_batch_attention_sigma_schedule
 from vllm_omni.diffusion.data import AttentionScheduleConfig, DiffusionOutput
 from vllm_omni.diffusion.forward_context import DenoiseProgressMixin, get_forward_context
-from vllm_omni.diffusion.sched.base_scheduler import BaseScheduler
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+from vllm_omni.diffusion.sched.step_scheduler import StepScheduler
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -136,11 +136,7 @@ def test_scheduler_keys_include_immutable_sigma_windows(mode):
     first, second = _request("a"), _request("b")
     first.sampling_params.attention_sigma_schedule = [{"low": 0.0, "high": 0.3, "profile": "low"}]
     second.sampling_params.attention_sigma_schedule = [{"low": 0.3, "high": 1.0, "profile": "high"}]
-    build = (
-        build_request_batch_sampling_params_key
-        if mode == "request"
-        else object.__new__(BaseScheduler)._build_sampling_params_key
-    )
+    build = build_request_batch_sampling_params_key if mode == "request" else StepScheduler()._build_sampling_params_key
     first_key, second_key = build(first), build(second)
     assert first_key != second_key
     assert isinstance(first_key.attention_sigma_schedule, tuple)

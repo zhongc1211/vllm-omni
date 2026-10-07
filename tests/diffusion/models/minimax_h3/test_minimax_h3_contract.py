@@ -1051,7 +1051,7 @@ def _distilled_pipeline(diffuse_calls, base_schedule_by_partition):
     return pipeline
 
 
-def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None):
+def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=None, attention_sigma_schedule=None):
     from vllm_omni.diffusion.request import OmniDiffusionRequest
     from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -1065,6 +1065,7 @@ def _t2va_batch(num_inference_steps=None, attention_schedule=None, extra_args=No
         num_inference_steps=num_inference_steps,
         extra_args={"task": "t2va", "aspect_ratio": "16:9", **(extra_args or {})},
         attention_schedule=attention_schedule,
+        attention_sigma_schedule=attention_sigma_schedule,
     )
     return DiffusionRequestBatch(
         [
