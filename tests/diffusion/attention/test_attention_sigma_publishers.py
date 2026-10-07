@@ -43,7 +43,7 @@ def test_switches_at_scheduler_noise_not_fraction_of_steps(count, shift):
             assert ctx.denoise_sigma == pytest.approx(sigma)
             assert ctx.denoise_timestep == pytest.approx(sigma)
             # The switch is bracketed by actual noise samples, not by i/count.
-            expected = "low_noise" if sigma <= 0.3 else None
+            expected = "low_noise" if sigma < 0.3 else None
             assert select_attention_profile_by_sigma(schedule, ctx.denoise_sigma) == expected
         publisher.record_denoise_step(None)
         assert ctx.denoise_sigma is None

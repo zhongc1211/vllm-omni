@@ -29,7 +29,7 @@ def test_sigma_schedule_inherits_disables_and_replaces():
 def test_sigma_schedule_rejects_overlap_and_unknown_profile():
     with pytest.raises(ValueError, match="overlap"):
         parse_attention_sigma_schedule(
-            [{"low": 0.0, "high": 0.5, "profile": "sparse"}, {"low": 0.5, "high": 1.0, "profile": "sparse"}]
+            [{"low": 0.0, "high": 0.6, "profile": "sparse"}, {"low": 0.5, "high": 1.0, "profile": "sparse"}]
         )
     with pytest.raises(ValueError, match="unknown profile"):
         resolve_attention_sigma_schedule([{"low": 0.0, "high": 0.2, "profile": "missing"}], (), profiles=set())
@@ -38,7 +38,7 @@ def test_sigma_schedule_rejects_overlap_and_unknown_profile():
 def test_sigma_selection_uses_normalized_noise_and_gaps():
     schedule = parse_attention_sigma_schedule([{"low": 0.0, "high": 0.3, "profile": "sparse"}])
     assert select_attention_profile_by_sigma(schedule, 0.0) == "sparse"
-    assert select_attention_profile_by_sigma(schedule, 0.3) == "sparse"
+    assert select_attention_profile_by_sigma(schedule, 0.3) is None
     assert select_attention_profile_by_sigma(schedule, 0.31) is None
 
 

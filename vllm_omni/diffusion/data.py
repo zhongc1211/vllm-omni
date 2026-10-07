@@ -2285,6 +2285,7 @@ class AttentionScheduleConfig:
         self.default = default
         from vllm_omni.diffusion.attention.schedule import (
             parse_attention_sigma_schedule,
+            reject_mixed_attention_schedules,
             validate_attention_sigma_schedule,
         )
 
@@ -2292,6 +2293,7 @@ class AttentionScheduleConfig:
         if sigma is None:
             raise TypeError("diffusion_attention_schedule.sigma must be a list of windows, not None")
         validate_attention_sigma_schedule(sigma, profiles=self.profiles)
+        reject_mixed_attention_schedules(self.default, sigma)
         self.sigma = sigma
 
 

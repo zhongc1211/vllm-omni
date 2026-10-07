@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Immutable integer-step schedules, independent of torch and attention backends."""
+"""Immutable step and normalized-noise schedules, independent of torch backends."""
+
+from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
@@ -143,7 +145,24 @@ def validate_request_attention_schedule(request: Any, od_config: Any) -> Attenti
     return resolve_attention_schedule(request_schedule, default, profiles=profiles)
 
 
-def resolve_batch_attention_sigma_schedule(states: Any, od_config: Any):
+def validate_request_attention_sigma_schedule(request: Any, od_config: Any) -> AttentionSigmaSchedule:
+    """Resolve and validate noise windows before request admission."""
+    sampling = SimpleRequest(request).sampling_params
+    service = getattr(od_config, "diffusion_attention_schedule", None) if od_config is not None else None
+    return resolve_attention_sigma_schedule(
+        getattr(sampling, "attention_sigma_schedule", None),
+        getattr(service, "sigma", None),
+        profiles=tuple(getattr(service, "profiles", None) or ()),
+    )
+
+
+def validate_request_attention_schedules(request: Any, od_config: Any) -> None:
+    step = validate_request_attention_schedule(SimpleRequest(request), od_config)
+    sigma = validate_request_attention_sigma_schedule(request, od_config)
+    reject_mixed_attention_schedules(step, sigma)
+
+
+def resolve_batch_attention_sigma_schedule(states: Any, od_config: Any) -> AttentionSigmaSchedule:
     """One resolved sigma schedule for a batch. Different windows must not share a denoise forward."""
     service = getattr(od_config, "diffusion_attention_schedule", None) if od_config is not None else None
     profiles = tuple(getattr(service, "profiles", None) or ())
@@ -246,7 +265,7 @@ _SIGMA_FIELDS = frozenset({"low", "high", "profile"})
 
 @dataclass(frozen=True)
 class AttentionSigmaWindow:
-    """Select a prepared profile while low <= normalized sigma <= high."""
+    """Select a profile on [low, high); a window ending at 1 also includes 1."""
 
     low: float
     high: float
@@ -287,7 +306,7 @@ def parse_attention_sigma_schedule(value: Any) -> AttentionSigmaSchedule | None:
             entry = AttentionSigmaWindow(**dict(item))
         else:
             raise TypeError("attention_sigma_schedule entries must be mappings or AttentionSigmaWindow objects")
-        if windows and entry.low <= windows[-1].high:
+        if windows and entry.low < windows[-1].high:
             raise ValueError("attention_sigma_schedule windows must be ordered and must not overlap")
         windows.append(entry)
     return tuple(windows)
@@ -335,7 +354,7 @@ def select_attention_profile_by_sigma(schedule: AttentionSigmaSchedule, sigma: f
     _validate_sigma(sigma, "sigma")
     validate_attention_sigma_schedule(schedule)
     for entry in schedule:
-        if entry.low <= float(sigma) <= entry.high:
+        if entry.low <= float(sigma) < entry.high or entry.high == sigma == 1.0:
             return entry.profile
     return None
 

@@ -31,13 +31,13 @@ class SigmaCudaGraphTable:
         if not 0.0 <= float(low) < float(high) <= 1.0:
             raise ValueError(f"CUDA graph window [{low}, {high}] must lie in [0, 1]")
         for existing in self._windows:
-            if existing.backend == backend and not (high < existing.low or low > existing.high):
+            if existing.backend == backend and not (high <= existing.low or low >= existing.high):
                 raise ValueError(f"CUDA graph windows overlap for backend {backend!r}")
         self._windows.append(SigmaGraphWindow(backend, float(low), float(high), graph))
 
     def select(self, backend: str, sigma: float) -> Any | None:
         for window in self._windows:
-            if window.backend == backend and window.low <= float(sigma) <= window.high:
+            if window.backend == backend and (window.low <= float(sigma) < window.high or window.high == sigma == 1.0):
                 return window.graph
         return None
 

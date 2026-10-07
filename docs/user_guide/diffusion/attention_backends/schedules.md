@@ -153,14 +153,36 @@ Each range is an object with exactly three keys:
   outside it, for example during prompt encoding or decoding, use the base
   configuration.
 
-A sigma schedule uses the same profiles and selects by the normalized noise
-value published as the denoise timestep, descending from 1 to 0. A window is
-`{"low": 0.0, "high": 0.3, "profile": "sparse"}` and includes both ends. `None`
-inherits the service windows, `[]` disables them, and an explicit list replaces
-them. A request cannot send both a non-empty step schedule and a non-empty
-sigma schedule. Request mode and step mode resolve the batch before denoising.
-If the timestep is missing while a sigma schedule is active, attention fails
-instead of using the base backend.
+### Sigma windows
+
+A sigma schedule uses the same prepared profiles but selects by normalized
+scheduler noise, not by the step index or raw model timestep.
+MiniMax-H3 publishes its shifted rectified-flow video sigma directly.
+Wan2.2 and HunyuanImage-3.0 use `scheduler.sigmas[i] / scheduler.sigmas[0]`;
+Wan DMD uses its fixed flow timestep divided by the training timestep scale.
+The independent context field `denoise_sigma` must be in `[0, 1]`.
+A missing or invalid sigma fails rather than silently choosing the base backend.
+
+Each window has exactly `low`, `high`, and `profile` keys.
+Boundaries are finite numbers with `0 <= low < high <= 1`.
+Windows are half-open **[low, high)**, except a window ending at **1.0**
+also includes **1.0**. List windows in ascending order; adjacent windows
+such as `[0, 0.3)` and `[0.3, 1]` are allowed. At sigma 0.3 the second
+window applies. Overlap, descending windows, out-of-range values, and
+undeclared profile names are rejected. Gaps use the base configuration.
+
+Sigma thresholds refer to noise values on the actual shifted trajectory.
+Changing the step count or flow shift changes which evaluation first crosses
+a threshold; it does not change the threshold. A discrete trajectory need not
+contain a sample exactly at the configured boundary.
+
+Use the service configuration's `sigma` list for defaults and the request's
+`attention_sigma_schedule` for overrides. `null` (Python `None`) inherits,
+`[]` disables, and a non-empty list replaces the windows.
+The effective step and sigma schedules cannot both be non-empty, including
+inherited defaults. To replace a step default with sigma windows, also send
+`attention_schedule: []`. The same rule applies at service startup.
+Request mode and step mode both validate the resolved batch before denoising.
 
 Range boundaries are step indices. The Skip-Softmax key
 `disabled_until_timestep` is a separate control that compares the normalized

@@ -158,7 +158,7 @@ class BaseScheduler(ABC):
     def _add_request_with_request_id(self, request_id: str, request: OmniDiffusionRequest) -> str:
         from vllm_omni.diffusion.attention.schedule import (
             InvalidAttentionScheduleError,
-            validate_request_attention_schedule,
+            validate_request_attention_schedules,
         )
         from vllm_omni.inputs.data import absorb_attention_schedule_extra_args
 
@@ -169,7 +169,7 @@ class BaseScheduler(ABC):
             sampling = getattr(request, "sampling_params", None)
             if sampling is not None:
                 absorb_attention_schedule_extra_args(sampling)
-            validate_request_attention_schedule(request, getattr(self, "od_config", None))
+            validate_request_attention_schedules(request, getattr(self, "od_config", None))
         except (TypeError, ValueError) as exc:
             raise InvalidAttentionScheduleError(str(exc)) from exc
         if request_id in self._request_states or request_id in self._kv_draining_requests:
