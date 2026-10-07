@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import vllm_omni.diffusion.attention.selector as selector
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -172,3 +172,55 @@ def test_load_backend_cls_reports_missing_class(monkeypatch):
 
     with pytest.raises(AttributeError, match="Class MissingBackend not found in module"):
         selector._load_backend_cls("fake.module.MissingBackend")
+
+
+def test_capability_backends_cover_baseline_and_every_profile(monkeypatch):
+    # Capability probes must see the schedule's profiles, not just the baseline.
+    monkeypatch.setattr(selector, "_cached_get_backend_cls", lambda *args, **kwargs: _PlatformBackend)
+    schedule = AttentionScheduleConfig(
+        profiles={
+            "cudnn": AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN")),
+            "implicit": AttentionConfig(),
+        },
+        default=[{"start": 0, "end": None, "profile": "cudnn"}],
+    )
+
+    entries = selector.resolve_capability_backends(role="self", attention_config=AttentionConfig(), schedule=schedule)
+
+    # An implicit profile resolves through the platform default with an unknown
+    # head size and may be promoted at construction, so the probe cannot speak for it. Only explicit
+    # profiles are enumerated; the post-load traversal judges prepared candidates from their own
+    # backend_cls and spec.
+    assert [label for label, _, _ in entries] == ["baseline", "profile:cudnn"]
+    assert entries[0][1] is _PlatformBackend
+    assert entries[0][2] is None
+    assert entries[1][1].get_name() == "CUDNN_ATTN"
+    assert entries[1][2] is not None and entries[1][2].backend == "CUDNN_ATTN"
+
+
+def test_capability_backends_skips_implicit_profiles(monkeypatch):
+    calls = []
+
+    def fake_get_backend(backend_name, head_size, allow_trtllm_default=True):
+        calls.append((backend_name, head_size))
+        return _PlatformBackend
+
+    monkeypatch.setattr(selector, "_cached_get_backend_cls", fake_get_backend)
+    schedule = AttentionScheduleConfig(
+        profiles={"implicit_a": AttentionConfig(), "implicit_b": AttentionConfig()},
+        default=[{"start": 0, "end": None, "profile": "implicit_a"}],
+    )
+
+    entries = selector.resolve_capability_backends(role="self", attention_config=None, schedule=schedule)
+
+    assert [label for label, _, _ in entries] == ["baseline"]
+    assert calls == [(None, selector.HEAD_SIZE_UNKNOWN)]
+
+
+def test_capability_backends_without_schedule_is_baseline_only(monkeypatch):
+    monkeypatch.setattr(selector, "_cached_get_backend_cls", lambda *args, **kwargs: _PlatformBackend)
+
+    entries = selector.resolve_capability_backends(role="self", attention_config=AttentionConfig(), schedule=None)
+
+    assert [label for label, _, _ in entries] == ["baseline"]
+    assert entries[0][1] is _PlatformBackend

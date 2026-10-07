@@ -20,7 +20,12 @@ from vllm.config.load import LoadConfig
 
 import vllm_omni.diffusion.model_loader.diffusers_loader as loader_module
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
@@ -2293,3 +2298,125 @@ def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpo
     else:
         assert result.plan is None
         assert "no checkpoint binding" in result.fallback_reason
+
+
+# --- The loader must hand the schedule to calibration and run startup candidate validation ---
+
+
+def _schedule_loader(schedule) -> DiffusersPipelineLoader:
+    od_config = OmniDiffusionConfig(
+        dtype=torch.float32,
+        parallel_config=DiffusionParallelConfig(use_hsdp=False),
+        quantization_config=None,
+        diffusion_attention_config=None,
+        diffusion_attention_schedule=schedule,
+    )
+    return DiffusersPipelineLoader(LoadConfig(), od_config)
+
+
+def test_loader_passes_schedule_to_calibration_and_validates_candidates(monkeypatch):
+    import vllm_omni.diffusion.attention.backends.trtllm_calibration as calib_mod
+    import vllm_omni.diffusion.attention.layer as layer_mod
+
+    schedule = AttentionScheduleConfig(profiles={"p": AttentionConfig()})
+    loader = _schedule_loader(schedule)
+    model = nn.Module()
+    calls = {}
+
+    def _fake_apply(cfg, pipeline, schedule=None):
+        calls["calibration"] = (cfg, schedule)
+
+    def _fake_validate(pipeline, od_config):
+        calls["validate"] = (pipeline, od_config)
+        return 7
+
+    monkeypatch.setattr(calib_mod, "apply_skip_softmax_calibration", _fake_apply)
+    monkeypatch.setattr(layer_mod, "validate_attention_schedule_candidates", _fake_validate)
+
+    loader._apply_skip_softmax_calibration(model)
+    validated = loader._validate_attention_schedule_candidates(model)
+
+    assert calls["calibration"][1] is loader.od_config.diffusion_attention_schedule is not None
+    assert validated == 7
+    assert calls["validate"][0] is model
+    assert calls["validate"][1] is loader.od_config
+
+
+def test_loader_skips_candidate_validation_without_schedule(monkeypatch):
+    import vllm_omni.diffusion.attention.layer as layer_mod
+
+    loader = _schedule_loader(None)
+
+    def _must_not_run(*args, **kwargs):
+        raise AssertionError("no schedule configured: the traversal must not run")
+
+    monkeypatch.setattr(layer_mod, "validate_attention_schedule_candidates", _must_not_run)
+
+    assert loader._validate_attention_schedule_candidates(nn.Module()) == 0
+
+
+@pytest.mark.parametrize(
+    ("branch", "expected_loaders"),
+    [
+        ("plain", ["init", "load_weights"]),
+        ("hsdp", ["hsdp"]),
+        ("hsdp-pre-sharded", ["init", "pre_sharded"]),
+    ],
+    ids=["plain", "hsdp", "hsdp-pre-sharded"],
+)
+def test_load_model_runs_both_schedule_hooks_on_every_load_branch(monkeypatch, branch, expected_loaders):
+    """load_model stamps calibration and then validates candidates, whichever branch built the model.
+
+    Each branch's inner loader is replaced by a fake that returns a small module, so no weights are
+    read. ``expected_loaders`` lists the fakes the branch must call, in order.
+    """
+    import vllm_omni.diffusion.attention.backends.trtllm_calibration as calib_mod
+    import vllm_omni.diffusion.attention.layer as layer_mod
+
+    schedule = AttentionScheduleConfig(profiles={"p": AttentionConfig()})
+    od_config = OmniDiffusionConfig(
+        dtype=torch.float32,
+        hsdp_weight_load_strategy="pre_sharded" if branch == "hsdp-pre-sharded" else "full",
+        quantization_config=None,
+        diffusion_attention_config=None,
+        diffusion_attention_schedule=schedule,
+        parallel_config=DiffusionParallelConfig(use_hsdp=branch != "plain", hsdp_replicate_size=1, hsdp_shard_size=2),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = nn.Module()
+    model.transformer = nn.Linear(2, 2, bias=False)
+    loaders: list[str] = []
+    hooks: list[tuple[str, object, object]] = []
+
+    def _fake_loader(name):
+        def _load(*_args, **_kwargs):
+            loaders.append(name)
+            return model
+
+        return _load
+
+    def _fake_apply(cfg, pipeline, schedule=None):
+        hooks.append(("calibration", pipeline, schedule))
+
+    def _fake_validate(pipeline, config):
+        hooks.append(("validate", pipeline, config))
+        return 1
+
+    monkeypatch.setattr(calib_mod, "apply_skip_softmax_calibration", _fake_apply)
+    monkeypatch.setattr(layer_mod, "validate_attention_schedule_candidates", _fake_validate)
+    loader._init_from_load_format = _fake_loader("init")  # type: ignore[method-assign]
+    loader.load_weights = _fake_loader("load_weights")  # type: ignore[method-assign]
+    loader._process_weights_after_loading = lambda *_args: None  # type: ignore[method-assign]
+    loader._load_model_with_pre_sharded_hsdp = _fake_loader("pre_sharded")  # type: ignore[method-assign]
+    if branch == "hsdp":
+        # The pre-sharded case keeps the real _load_model_with_hsdp, which dispatches on the strategy.
+        loader._load_model_with_hsdp = _fake_loader("hsdp")  # type: ignore[method-assign]
+
+    loaded = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    assert loaded is model
+    assert loaders == expected_loaders
+    assert [name for name, _pipeline, _arg in hooks] == ["calibration", "validate"]
+    assert all(pipeline is model for _name, pipeline, _arg in hooks)
+    assert hooks[0][2] is od_config.diffusion_attention_schedule is not None
+    assert hooks[1][2] is od_config

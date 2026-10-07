@@ -208,6 +208,11 @@ OmniDiffusionSamplingParams(
 The startup option is only needed when omitted-quality requests should use the
 server-configured Cache-DiT profile by default.
 
+A server that configures attention schedule profiles cannot start with
+`--cache-backend`, and it rejects a `quality=high` request whose attention
+schedule is not empty. See
+[Attention Schedules](../attention_backends/schedules.md#compatibility-limits).
+
 See the [MiniMax H3 recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#request-scoped-quality)
 for a complete request and measured trade-off.
 

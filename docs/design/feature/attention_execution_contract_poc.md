@@ -12,16 +12,23 @@ reports its identity, support status and reason, and compilation mode.
 `AttentionBackend.resolve_capabilities()` provides conservative pre-construction
 results. After initialization, `Attention.resolve_execution_path()` supplies the
 active parallel, paged-KV, and HSDP context; the backend combines it with the
-selected kernel and normalized metadata.
+selected kernel and normalized metadata. For a layer built with
+[attention schedule](../../user_guide/diffusion/attention_backends/schedules.md)
+profiles configured, it also supplies the `ATTENTION_SCHEDULE` boundary, because
+that layer's attention call runs eagerly under `torch.compile`, and it resolves
+the implementation selected at that moment: the one prepared for the profile
+that the schedule selects at the published denoise step, otherwise the base
+implementation. FA4 therefore reports `UNMIGRATED` and `EAGER_ONLY` for such a
+layer.
 
 Resolution runs outside compiled execution. FA4 reports `SUPPORTED` and
-`CUSTOM_OP` for dense, noncausal BF16 without parallel or HSDP boundaries when
-its kernel accepts the head dimensions. Dimension validation delegates to FA4's
-architecture-specific rules through `backends/utils/fa.py`. Kernel rejections
-report `UNSUPPORTED` with an actionable reason. Missing private validators and
-other unmigrated paths report `UNMIGRATED` with advisory `EAGER_ONLY` defaults.
-`requested_support()` checks a fullgraph request; it does not enforce selection
-or change existing execution.
+`CUSTOM_OP` for dense, noncausal BF16 without parallel, HSDP, or attention
+schedule boundaries when its kernel accepts the head dimensions. Dimension
+validation delegates to FA4's architecture-specific rules through
+`backends/utils/fa.py`. Kernel rejections report `UNSUPPORTED` with an
+actionable reason. Missing private validators and other unmigrated paths report
+`UNMIGRATED` with advisory `EAGER_ONLY` defaults. `requested_support()` checks a
+fullgraph request; it does not enforce selection or change existing execution.
 
 FA4 execution uses an opaque custom op. Its fake output preserves Q's batch,
 sequence, and head count and uses V's head dimension. Output is contiguous even

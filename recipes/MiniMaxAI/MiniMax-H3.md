@@ -1723,6 +1723,13 @@ memory a full-length activation volume takes (10.1 GiB against 5.6 GiB at
   own resolution and its own truncated schedule, and the step contract carries
   one schedule per request, so step execution rejects it. `latent_upscale`
   without `latent_refine` works in both modes.
+- `latent_refine` cannot be combined with a non-empty attention schedule,
+  including a schedule inherited from the server's default ranges. In request
+  mode the request is rejected before denoising. Send
+  `"attention_schedule": []` to keep `latent_refine`, or
+  `"latent_refine": false` to keep the schedule. See
+  [Compatibility limits](https://github.com/vllm-project/vllm-omni/blob/main/docs/user_guide/diffusion/attention_backends/schedules.md#compatibility-limits)
+  in the attention schedules guide.
 - Large refine layouts can abort workers with `CUDA error: an illegal memory
   access was encountered`. On B300, observed video token counts of 54,144 per
   rank complete while 108,288 and 109,360 abort. The preflight limit of 65,536
