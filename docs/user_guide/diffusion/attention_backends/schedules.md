@@ -1,8 +1,9 @@
 # Attention Schedules
 
 An attention schedule switches the attention configuration at fixed denoising
-step indices. For example, a schedule can keep the first steps on a dense base
-configuration and run the later steps with a sparse or quantized profile.
+step indices or normalized noise levels (sigma). For example, a schedule can
+keep high-noise evaluations on a dense base configuration and run lower-noise
+evaluations with a sparse or quantized profile.
 
 A schedule configuration has two parts:
 
@@ -152,6 +153,128 @@ Each range is an object with exactly three keys:
 - The schedule is active only inside the denoising loop. Attention calls
   outside it, for example during prompt encoding or decoding, use the base
   configuration.
+
+### Sigma windows
+
+A sigma schedule uses the same prepared profiles but selects by normalized
+scheduler noise, not by the step index or raw model timestep.
+MiniMax-H3 publishes its shifted rectified-flow video sigma directly.
+Wan2.2 and HunyuanImage-3.0 use `scheduler.sigmas[i] / scheduler.sigmas[0]`;
+Wan DMD uses its fixed flow timestep divided by the training timestep scale.
+The independent context field `denoise_sigma` must be in `[0, 1]`.
+A missing or invalid sigma fails rather than silently choosing the base backend.
+
+Each window has exactly `low`, `high`, and `profile` keys.
+Boundaries are finite numbers with `0 <= low < high <= 1`.
+Windows are half-open **[low, high)**, except a window ending at **1.0**
+also includes **1.0**. List windows in ascending order; adjacent windows
+such as `[0, 0.3)` and `[0.3, 1]` are allowed. At sigma 0.3 the second
+window applies. Overlap, descending windows, out-of-range values, and
+undeclared profile names are rejected. Gaps use the base configuration.
+
+Sigma thresholds refer to noise values on the actual shifted trajectory.
+Changing the step count or flow shift changes which evaluation first crosses
+a threshold; it does not change the threshold. A discrete trajectory need not
+contain a sample exactly at the configured boundary.
+
+Use the service configuration's `sigma` list for defaults and the request's
+`attention_sigma_schedule` for overrides. `null` (Python `None`) inherits,
+`[]` disables, and a non-empty list replaces the windows.
+The effective step and sigma schedules cannot both be non-empty, including
+inherited defaults. To replace a step default with sigma windows, also send
+`attention_schedule: []`. The same rule applies at service startup.
+Request mode and step mode both validate the resolved batch before denoising.
+
+#### Server CLI and deploy configuration
+
+The existing `--diffusion-attention-schedule` flag accepts a `sigma` key;
+there is no separate sigma flag or environment variable. For example:
+
+```bash
+vllm-omni serve <model> \
+  --diffusion-attention-backend TORCH_SDPA \
+  --diffusion-attention-schedule '{
+    "profiles": {"flash": {"default": "FLASH_ATTN"}},
+    "sigma": [{"low": 0.3, "high": 1.0, "profile": "flash"}]
+  }'
+```
+
+This uses Flash at sigma 0.3 through 1.0 and the SDPA base below 0.3.
+The selected model, hardware and attention roles must satisfy the same
+[compatibility limits](#compatibility-limits) as step schedules.
+The corresponding dotted form is:
+
+```bash
+--diffusion-attention-schedule.profiles.flash.default FLASH_ATTN \
+--diffusion-attention-schedule.sigma '[{"low":0.3,"high":1.0,"profile":"flash"}]'
+```
+
+Set `diffusion_attention_schedule.sigma` on the diffusion stage in a deploy
+configuration:
+
+```yaml
+diffusion_attention_schedule:
+  profiles:
+    flash:
+      default:
+        backend: FLASH_ATTN
+  sigma:
+    - low: 0.3
+      high: 1.0
+      profile: flash
+```
+
+CLI lists replace the corresponding deploy-configuration lists; they are not
+merged window by window. If the deploy configuration has non-empty `default`
+step ranges, clear them with `--diffusion-attention-schedule.default '[]'`
+when setting non-empty `sigma` windows.
+
+#### Request overrides
+
+Use `attention_sigma_schedule` in the same entrypoint-specific object as
+`attention_schedule`: video/image `extra_params`, chat `extra_args`, or
+the offline sampling parameters. For example:
+
+```bash
+curl -X POST http://localhost:8091/v1/videos/sync \
+  -F "prompt=A boat on a lake." \
+  -F "num_inference_steps=40" \
+  -F "seed=42" \
+  -F 'extra_params={"attention_sigma_schedule":[{"low":0.0,"high":0.3,"profile":"flash"}]}' \
+  -o boat.mp4
+```
+
+```python
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+sampling_params = OmniDiffusionSamplingParams(
+    num_inference_steps=40,
+    seed=42,
+    attention_sigma_schedule=[{"low": 0.0, "high": 0.3, "profile": "flash"}],
+)
+```
+
+A stage `default_sampling_params.attention_sigma_schedule` supplies a request
+default; an omitted or `null` value keeps it, `[]` disables it, and an explicit
+list replaces it. Endpoint limitations listed under
+[request overrides](#override-the-schedule-in-a-request) apply to both fields.
+A request cannot define new profiles.
+
+#### Sigma batching
+
+Scheduler batch keys include the immutable sigma windows as well as the step
+ranges. Request mode rejects a batch whose resolved windows differ.
+In step mode, equal windows do not imply equal current profiles: two requests
+at the same step can have different noise levels because their step counts or
+flow shifts differ. The runner conservatively executes every sigma-scheduled
+request in a separate denoiser forward, including requests selecting the same
+profile, because some backends do not isolate packed documents. Predictions
+are restored to the original request order. This can reduce batching throughput.
+
+A non-empty sigma schedule cannot reuse Cache-DiT transformer outputs across
+steps. MiniMax-H3 rejects explicit and inherited sigma windows before
+installing request-scoped Cache-DiT; use `quality=lossless` or disable the
+active sigma schedule with `attention_sigma_schedule: []`.
 
 Range boundaries are step indices. The Skip-Softmax key
 `disabled_until_timestep` is a separate control that compares the normalized
@@ -431,13 +554,15 @@ LoRA, and no test covers those combinations.
 ## Compilation
 
 With profiles configured, each attention layer selects its implementation at
-call time from the published step index. To keep that selection out of the
-compiled graph, the attention call runs eagerly. The rest of a compiled block,
-such as projections and normalization, stays compiled. See
+call time from the published step index or sigma. Selection and compatibility
+checks run outside Dynamo. Step-scheduled kernels remain eager; eligible
+sigma-scheduled kernels can replay explicit CUDA graphs, as described below.
+The rest of a compiled block, such as projections and normalization, stays
+compiled. See
 [Regional Compilation](../regional_compilation.md) for the compile settings.
 
-- The eager attention call applies to every request on a server that
-  configures profiles. This includes requests that send
+- The eager attention selection boundary applies to every request on a server
+  that configures profiles. This includes requests that send
   `"attention_schedule": []` and servers whose default ranges are empty. A
   server without profiles does not make this eager call.
 - **Wan2.2**: the attention calls inside each compiled transformer block run
@@ -451,7 +576,7 @@ such as projections and normalization, stays compiled. See
   without compiled blocks.
 
 No profile runs during startup. Wan2.2 T2V, I2V, and VACE send one startup
-warm-up request, with an empty schedule. MiniMax-H3, HunyuanImage-3.0, and
+warm-up request, with both step and sigma schedules explicitly disabled. MiniMax-H3, HunyuanImage-3.0, and
 Wan2.2 S2V send no startup warm-up request, so on MiniMax-H3 and Wan2.2 S2V
 the first request also compiles the blocks.
 
@@ -480,6 +605,46 @@ those models, have not been measured.
 
 After startup, send one warm-up request that runs the base configuration and
 every profile for at least one step each before you measure latency.
+
+### Explicit CUDA graphs for sigma schedules
+
+On a CUDA service using the generic compile setup without `--enforce-eager`,
+the first eligible sigma-scheduled attention call warms and captures the
+baseline and every compatible prepared implementation for that Q/K/V signature.
+Capture happens after actual shapes are known, not at startup. Profiles with
+identical prepared configurations share one entry. Profiles using the same
+backend with different options remain distinct.
+
+Each entry owns static Q/K/V and consumed metadata buffers. Replay copies
+the current inputs into those buffers and returns an output copy so the next
+replay cannot overwrite a previous result. Releasing a captured entry waits
+for outstanding replay before freeing its graph-private storage. The cache retains at most one
+signature per prepared implementation. Shapes, strides, dtype, device, Python
+metadata values, inference mode, or CUDA autocast changes use eager execution
+rather than creating an unbounded graph cache. Sigma values themselves are not graph keys.
+The runner disables compiler-managed CUDA graphs around these explicit graphs.
+
+Currently audited capture paths are `TORCH_SDPA` (including runtime masks)
+and CUDA `FLASH_ATTN` (dense or producer-supplied packed cu_seqlens).
+The following remain eager: TRTLLM (including ungated configurations),
+RAINFUSION, FASTVIDEO_VSA, other unaudited backends/overrides, Flash piecewise
+plans or mask unpadding, ring/paged execution, offload, HSDP, and pipeline-owned
+`setup_compile()` routes. TRTLLM's shared scratch workspace and private
+timestep gates are not captured. Backend coverage is therefore partial:
+configuring sigma windows does not guarantee graph replay on every backend.
+Without CUDA, attention stays eager. Capture errors are reported rather than
+silently hidden by a fallback.
+
+CPU compile tests cover varying sigma values, window boundaries, step counts
+and flow shifts. They compare tensor outputs against equivalent step schedules
+and check that surrounding compiled graphs execute without sigma-driven
+recompilation. These are toy-model tests, not GPU performance measurements.
+
+**GPU acceptance: TODO.** Run the capture/replay tests on CUDA; compare
+equivalent sigma and step schedules on real weights; verify threshold crossings
+at different step counts and flow shifts; and report steady-state seconds per
+step after warming the baseline and every selected profile. No sigma-schedule
+GPU latency or quality result is established by this change.
 
 ## Confirm that a schedule takes effect
 

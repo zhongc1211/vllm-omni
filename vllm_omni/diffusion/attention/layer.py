@@ -180,6 +180,10 @@ class Attention(nn.Module):
         # diffusion config, and such a layer legitimately prepares no candidates, so startup
         # validation must not report it as a missing profile.
         self._schedule_configured: bool = False
+        # Runner-enabled explicit graphs; absent in CPU/enforce_eager execution.
+        self._sigma_graph_cache = None
+        self._sigma_graph_candidates = None
+        self._sigma_graph_fallback_registered = False
         # Model-owned requirements on every candidate of this layer (add_schedule_candidate_check).
         self._schedule_candidate_checks: list[Callable[[_PreparedCandidate], str | None]] = []
 
@@ -858,7 +862,11 @@ class Attention(nn.Module):
             )
         ):
             logger.warning_once("Using SDPA for this layer's FP32 input with automatic CUDA FlashAttention selection.")
-            return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
+            if getattr(self, "_sigma_graph_cache", None) is None:
+                return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
+            return self._run_sigma_graph_attention(
+                cast(AttentionImpl, self.sdpa_fallback), query, key, value, attn_metadata
+            )
 
         in_kv_memory_profile = is_forward_context_available() and get_forward_context().in_diffusion_kv_memory_profile
         # The startup KV-capacity profile needs tensor shapes, not a paged
@@ -881,7 +889,38 @@ class Attention(nn.Module):
             )
             return cast(AttentionImpl, self.sdpa_fallback).forward(query, key, value, attn_metadata)
 
-        return effective_impl.forward(query, key, value, attn_metadata)
+        if getattr(self, "_sigma_graph_cache", None) is None:
+            return effective_impl.forward(query, key, value, attn_metadata)
+        return self._run_sigma_graph_attention(effective_impl, query, key, value, attn_metadata)
+
+    def _run_sigma_graph_attention(self, impl, query, key, value, attn_metadata):
+        cache = self._sigma_graph_cache
+        if cache is None:
+            return impl.forward(query, key, value, attn_metadata)
+        ctx = get_forward_context() if is_forward_context_available() else None
+        if (
+            ctx is None
+            or not ctx.attention_sigma_schedule_active
+            or not ctx.attention_sigma_schedule
+            or ctx.in_diffusion_kv_memory_profile
+        ):
+            return impl.forward(query, key, value, attn_metadata)
+        # Selection and metadata validation have already run outside Dynamo.
+        # Deduplicated profiles share objects; same-backend configurations do not.
+        candidates = self._sigma_graph_candidates
+        if candidates is None:
+            candidates = tuple(
+                {
+                    id(candidate): candidate
+                    for candidate in (self.attention, *(record.impl for record in self._schedule_candidates.values()))
+                }.values()
+            )
+            self._sigma_graph_candidates = candidates
+        if impl is self.sdpa_fallback and not self._sigma_graph_fallback_registered:
+            candidates = (*candidates, impl)
+            self._sigma_graph_candidates = candidates
+            self._sigma_graph_fallback_registered = True
+        return cache.run(impl, candidates, query, key, value, attn_metadata)
 
     def _selects_automatic_flash_attention(self, impl, backend, spec) -> bool:
         """Whether the selected implementation is an automatic FLASH_ATTN choice.
@@ -918,15 +957,30 @@ class Attention(nn.Module):
             return impl, backend, spec
         ctx = get_forward_context()
         schedule = getattr(ctx, "attention_schedule", None)
-        if not schedule or not getattr(ctx, "attention_schedule_denoise_active", False):
-            return impl, backend, spec
-        step_idx = ctx.denoise_step_idx
-        total_steps = ctx.total_denoise_steps
-        if step_idx is None or total_steps is None:
-            raise RuntimeError("active denoise attention schedule requires denoise_step_idx and total_denoise_steps")
-        from vllm_omni.diffusion.attention.schedule import select_attention_profile
+        sigma_schedule = getattr(ctx, "attention_sigma_schedule", None)
+        step_active = bool(schedule) and getattr(ctx, "attention_schedule_denoise_active", False)
+        sigma_active = bool(sigma_schedule) and getattr(ctx, "attention_sigma_schedule_active", False)
+        if step_active and sigma_active:
+            raise RuntimeError("a request cannot combine attention_schedule with attention_sigma_schedule")
+        if sigma_active:
+            sigma = getattr(ctx, "denoise_sigma", None)
+            if sigma is None:
+                raise RuntimeError("active sigma attention schedule requires denoise_sigma")
+            from vllm_omni.diffusion.attention.schedule import select_attention_profile_by_sigma
 
-        name = select_attention_profile(schedule, step_idx, total_steps=total_steps)
+            name = select_attention_profile_by_sigma(sigma_schedule, sigma)
+        elif step_active:
+            step_idx = ctx.denoise_step_idx
+            total_steps = ctx.total_denoise_steps
+            if step_idx is None or total_steps is None:
+                raise RuntimeError(
+                    "active denoise attention schedule requires denoise_step_idx and total_denoise_steps"
+                )
+            from vllm_omni.diffusion.attention.schedule import select_attention_profile
+
+            name = select_attention_profile(schedule, step_idx, total_steps=total_steps)
+        else:
+            return impl, backend, spec
         if name is None:
             return impl, backend, spec
         record = self._schedule_candidates.get(name)
