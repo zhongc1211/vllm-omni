@@ -21,6 +21,7 @@ from vllm_omni.diffusion.data import (
     AttentionSpec,
     DiffusionOutput,
     DiffusionRequestAbortedError,
+    OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine, DiffusionExecutionMode
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
@@ -729,8 +730,9 @@ class TestRequestScheduler:
         mocker.patch.object(
             self.scheduler,
             "_can_schedule_waiting",
-            side_effect=lambda state: can_schedule(state)
-            and not (state.request_id == "deferred" and manager.has_request("deferred")),
+            side_effect=lambda state: (
+                can_schedule(state) and not (state.request_id == "deferred" and manager.has_request("deferred"))
+            ),
         )
         for request_id in ("admitted", "deferred"):
             request = _make_request(request_id)
@@ -2237,7 +2239,7 @@ class TestStepScheduler:
 
     def test_step_add_request_rejects_unknown_attention_profile(self) -> None:
         scheduler = StepScheduler()
-        scheduler.initialize(SimpleNamespace(diffusion_attention_schedule=_attention_schedule_service()))
+        scheduler.initialize(OmniDiffusionConfig(diffusion_attention_schedule=_attention_schedule_service()))
         request = _make_step_request(
             "bad",
             sampling_params=OmniDiffusionSamplingParams(
@@ -2254,7 +2256,7 @@ class TestStepScheduler:
         """Equal schedules co-batch; a different schedule waits for the next batch in FIFO order."""
         scheduler = StepScheduler()
         scheduler.initialize(
-            SimpleNamespace(max_num_seqs=3, diffusion_attention_schedule=_attention_schedule_service())
+            OmniDiffusionConfig(max_num_seqs=3, diffusion_attention_schedule=_attention_schedule_service())
         )
 
         def _build(req_id: str, start: int) -> OmniDiffusionRequest:

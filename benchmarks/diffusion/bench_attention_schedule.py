@@ -57,12 +57,12 @@ or ``not_measured``, and a ``pass`` proves what is written here:
                       every block call of ``reference_a`` and ``candidate``
                       ran a compiled graph, none ran eagerly
     shifted_boundary  the ``boundary_shift`` request selected what its
-                      schedule states, compiled no new graph and ran compiled
-                      graphs only: moving the first profile step needs no
+                      schedule states, made no backend compilation attempt and
+                      ran compiled graphs only: moving the first profile step needs no
                       new compilation
     timing            the seconds per step are usable for a comparison: every
-                      sample is present, the batch size is 1, no graph was
-                      compiled in a measured request and the warm-up ran
+                      sample is present, the batch size is 1, no backend compile
+                      attempt occurred in a measured request and the warm-up ran
                       every selection first. The item applies no speed
                       threshold; the report holds the samples and medians
     lpips             an LPIPS score of the candidate output against the
@@ -86,6 +86,14 @@ six combinations are proven and ``shifted_boundary`` passed on at least one of
 them and failed on none; otherwise it is ``Acceptance: NOT PROVEN``. The
 second line, ``Shifted boundary: ...``, lists the combinations on which that
 item passed and failed.
+
+Compiler records use ``inductor-attempts-v1``: backend calls, successful
+returns, tensorification restarts and other errors are separate counters. A
+restart is rethrown unchanged for Dynamo to handle. Request-boundary snapshots
+are required to prove that measurement and boundary-shift requests made no
+backend compile attempt. Older records lack that evidence; missing counters
+are never assumed to be zero. Attempts that stop before reaching the backend
+are not counted, so warm-up coverage and executed-graph checks remain required.
 
 Requirements for ``run``:
     pip install lpips Pillow numpy
@@ -183,7 +191,7 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 SCHEMA = "attention-schedule-bench/1"
 SESSIONS = ("scheduled", "plain", "prechange")
@@ -215,6 +223,7 @@ TRTLLM_MODULE = "vllm_omni.diffusion.attention.backends.trtllm_attn"
 TRTLLM_KERNEL = "trtllm_ragged_attention_deepseek"
 KERNEL_PROBE_BACKEND = "TRTLLM_ATTN"
 COMPILE_MECHANISM = "torch._TorchCompileInductorWrapper.__call__"
+COMPILE_COUNTER_SCHEMA = "inductor-attempts-v1"
 H3_LOOP_PARAMETERS = ("on_step", "step_profiler", "initial_video_rows", "initial_audio_rows", "sigmas_video")
 
 SCHEDULED_REQUESTS = ("warmup", "reference_a", "reference_b", "candidate")
@@ -227,7 +236,14 @@ FALLBACK_REASONS = (
     "layer_fallback",
     "unclassified",
 )
-ENV_NAMES = ("CUDA_VISIBLE_DEVICES", "CUBLAS_WORKSPACE_CONFIG", "PYTHONPATH", "TORCH_LOGS")
+ENV_NAMES = (
+    "CUDA_VISIBLE_DEVICES",
+    "CUBLAS_WORKSPACE_CONFIG",
+    "PYTHONPATH",
+    "TORCH_LOGS",
+    "DIFFUSION_ATTENTION_BACKEND",
+    "DIFFUSION_ATTENTION_QUANT",
+)
 ENV_PREFIXES = ("TORCHINDUCTOR_", "TORCHDYNAMO_", "PYTORCH_")
 LABEL_BAND = 32
 
@@ -820,6 +836,8 @@ class Recorder:
         self._outside_steps = 0
         self._setup_calls: list[dict[str, Any]] = []
         self._graphs_compiled = 0
+        self._compile_attempts = 0
+        self._compile_restarts = 0
         self._compile_errors = 0
         self._graph_execs = 0
         self._block_stack: list[tuple[int, int]] = []
@@ -851,6 +869,7 @@ class Recorder:
                 "sequences": [],
                 "unattributed": _new_counts(),
                 "graphs_compiled_before": self._graphs_compiled,
+                "compile_before": self._compile_counts(),
             }
 
     def end_request(self) -> dict[str, Any]:
@@ -870,6 +889,8 @@ class Recorder:
                 "unattributed": request["unattributed"],
                 "graphs_compiled_before": request["graphs_compiled_before"],
                 "graphs_compiled_after": self._graphs_compiled,
+                "compile_before": request["compile_before"],
+                "compile_after": self._compile_counts(),
             }
 
     def begin_sequence(self, source: str, total_steps: int | None, initial: Mapping[str, Any]) -> None:
@@ -994,6 +1015,23 @@ class Recorder:
             )
             return index
 
+    def _compile_counts(self) -> dict[str, int]:
+        """Snapshot counters while the caller holds the recorder lock."""
+        return {
+            "compile_attempts": self._compile_attempts,
+            "graphs_compiled": self._graphs_compiled,
+            "compile_restarts": self._compile_restarts,
+            "compile_errors": self._compile_errors,
+        }
+
+    def note_compile_attempt(self) -> None:
+        with self._lock:
+            self._compile_attempts += 1
+
+    def note_compile_restart(self) -> None:
+        with self._lock:
+            self._compile_restarts += 1
+
     def note_graph_compiled(self) -> int:
         with self._lock:
             index = self._graphs_compiled
@@ -1078,7 +1116,7 @@ class Recorder:
             for kernel_call in kernel_calls:
                 self._count_kernel_call(attention["kernel"], kernel_call)
             ctx_step = info.get("ctx_step")
-            if ctx_step is not None and ctx_step != self._step["step"]:
+            if ctx_step is not None and ctx_step != cast(dict[str, Any], self._step)["step"]:
                 attention["step_mismatch_calls"] += 1
             if selection == "<error>":
                 attention["probe_errors"] += 1
@@ -1117,8 +1155,7 @@ class Recorder:
         with self._lock:
             return {
                 "setup_calls": copy.deepcopy(self._setup_calls),
-                "graphs_compiled": self._graphs_compiled,
-                "compile_errors": self._compile_errors,
+                **self._compile_counts(),
                 "outside_requests": dict(self._outside),
             }
 
@@ -1126,9 +1163,8 @@ class Recorder:
         with self._lock:
             return {
                 "setup_calls": len(self._setup_calls),
-                "graphs_compiled": self._graphs_compiled,
+                **self._compile_counts(),
                 "graph_execs": self._graph_execs,
-                "compile_errors": self._compile_errors,
             }
 
 
@@ -1151,7 +1187,9 @@ def install_compile_probe(patches: PatchSet, recorder: Recorder) -> None:
     """Count the graphs Inductor compiles and how often each compiled graph runs.
 
     The production ``torch.compile`` call is unchanged. Dynamo calls the patched
-    ``__call__`` once per graph and receives a closure around Inductor's callable.
+    ``__call__`` for each backend attempt and receives a closure around each
+    successful callable. Tensorification restarts are counted separately, not
+    suppressed: Dynamo must still receive the same exception and handle it.
     """
     import torch
 
@@ -1159,10 +1197,17 @@ def install_compile_probe(patches: PatchSet, recorder: Recorder) -> None:
     original: Any = None
 
     def counting_call(self: Any, *args: Any, **kwargs: Any) -> Any:
+        recorder.note_compile_attempt()
         try:
             compiled = original(self, *args, **kwargs)
-        except Exception:
-            recorder.note_compile_error()
+        except Exception as exc:
+            # Do not import Dynamo or change its settings from this observer. If
+            # this version has no recognized type, retain the error classification.
+            restart_type = getattr(sys.modules.get("torch._dynamo.exc"), "TensorifyScalarRestartAnalysis", None)
+            if isinstance(restart_type, type) and issubclass(restart_type, Exception) and isinstance(exc, restart_type):
+                recorder.note_compile_restart()
+            else:
+                recorder.note_compile_error()
             raise
         index = recorder.note_graph_compiled()
 
@@ -1272,7 +1317,8 @@ def _attention_info(layer: Any, is_available: Callable[[], bool], get_context: C
             names = sorted(name for name, record in candidates.items() if getattr(record, "impl", None) is impl)
             info["selection"] = "|".join(names) if names else "<unknown>"
     with contextlib.suppress(Exception):
-        info["backend"] = backend_cls.get_name()
+        if backend_cls is not None:
+            info["backend"] = backend_cls.get_name()
     quant = getattr(getattr(impl, "quant", None), "enabled", None)
     skip = getattr(impl, "skip", None)
     skip_enabled, skip_configured = getattr(skip, "enabled", None), getattr(skip, "configured", None)
@@ -1426,7 +1472,7 @@ def install_h3_step_adapter(
         recorder.end_sequence(None)
         return originals["post_decode"](self, state, *args, **kwargs)
 
-    replacements = {
+    replacements: dict[str, Callable[..., Any]] = {
         "denoise_step": capturing_denoise_step,
         "step_scheduler": capturing_step_scheduler,
         "post_decode": capturing_post_decode,
@@ -1450,10 +1496,12 @@ def install_wan_request_adapter(
     module_path: str = WAN_PIPELINE_MODULE,
     class_name: str = WAN_PIPELINE_CLASS,
 ) -> None:
-    """Capture each Wan2.2 step at the noise prediction: its input latent and its output.
+    """Capture each Wan2.2 step at noise prediction: latent, conditioning, timestep and output.
 
     The capture is at predict_noise_maybe_with_cfg because the DMD branch of
     diffuse skips the scheduler step. A step ends when the next one begins.
+    Conditioning and timestep tensors are hashed when supplied, on both CFG
+    branches. The original tensors and arguments are passed through unchanged.
     """
     import torch
 
@@ -1489,7 +1537,9 @@ def install_wan_request_adapter(
     def capturing_predict(self: Any, *args: Any, **kwargs: Any) -> Any:
         if torch.compiler.is_compiling() or not recorder.sequence_open():
             return originals["predict"](self, *args, **kwargs)
-        positive = predict_signature.bind(self, *args, **kwargs).arguments.get("positive_kwargs") or {}
+        arguments = predict_signature.bind(self, *args, **kwargs).arguments
+        positive = arguments.get("positive_kwargs") or {}
+        negative = arguments.get("negative_kwargs") or {}
         model = positive.get("current_model")
         label = None
         if model is not None:
@@ -1500,7 +1550,19 @@ def install_wan_request_adapter(
             else:
                 label = f"<other:{type(model).__name__}>"
         recorder.begin_step(recorder.steps_in_sequence(), transformer=label)
-        _record_digests(recorder, {"latent_in": positive.get("hidden_states")})
+        inputs = {"latent_in": positive.get("hidden_states")}
+        for branch, supplied in (("positive", positive), ("negative", negative)):
+            for key in ("timestep", "encoder_hidden_states"):
+                value = supplied.get(key)
+                if value is not None:
+                    if key == "timestep" and isinstance(value, torch.Tensor):
+                        # A singleton expand has stride 0 even when contiguous;
+                        # a dtype view needs canonical strides for byte hashing.
+                        value = value.detach().clone(memory_format=torch.contiguous_format)
+                    inputs[f"{branch}_{key}"] = value
+        if negative.get("hidden_states") is not None:
+            inputs["negative_latent_in"] = negative["hidden_states"]
+        _record_digests(recorder, inputs)
         result = originals["predict"](self, *args, **kwargs)
         _record_digests(recorder, {"noise_pred": _first_tensor(result)})
         return result
@@ -2352,7 +2414,15 @@ def _new_record(config: dict[str, Any], session: str, argv: Sequence[str] | None
         },
         "probes": {
             "installed": [],
-            "compile": {"mechanism": COMPILE_MECHANISM, "setup_calls": [], "graphs_compiled": 0, "compile_errors": 0},
+            "compile": {
+                "mechanism": COMPILE_MECHANISM,
+                "counter_schema": COMPILE_COUNTER_SCHEMA,
+                "setup_calls": [],
+                "compile_attempts": 0,
+                "graphs_compiled": 0,
+                "compile_restarts": 0,
+                "compile_errors": 0,
+            },
             "kernel": None,
             "outside_requests": None,
         },
@@ -2463,6 +2533,8 @@ def run_session(
                 "wall_seconds": None,
                 "graphs_compiled_before": None,
                 "graphs_compiled_after": None,
+                "compile_before": None,
+                "compile_after": None,
                 "sequences": [],
                 "unattributed": None,
                 "output": None,
@@ -2530,6 +2602,8 @@ def run_session(
         record["probes"]["compile"].update(
             setup_calls=snapshot["setup_calls"],
             graphs_compiled=snapshot["graphs_compiled"],
+            compile_attempts=snapshot["compile_attempts"],
+            compile_restarts=snapshot["compile_restarts"],
             compile_errors=snapshot["compile_errors"],
         )
         record["probes"]["outside_requests"] = snapshot["outside_requests"]
@@ -2740,7 +2814,7 @@ def _rule_dense_repeatable(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     first, second = context.indices["reference_a"], context.indices["reference_b"]
-    fail, unproven, values = [], [], {}
+    fail, unproven, values = [], [], {}  # type: list[str], list[str], dict[str, int]
     if reader.get(f"/requests/{second}/attention_schedule") != []:
         fail.append("reference_schedule_not_empty")
     for sequence in range(context.sequences):
@@ -2814,7 +2888,7 @@ def _rule_profile_switch(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     mismatches += _selection_mismatches(reader, context, "reference_a", [None] * context.total_steps)
     if mismatches:
         return _item("fail", ["selection_mismatch"], reader.evidence, {"steps": mismatches})
-    fail, unproven, values = [], [], {"first_switch": switch}
+    fail, unproven, values = [], [], {"first_switch": switch}  # type: list[str], list[str], dict[str, int | None]
     for sequence in range(context.sequences):
         differing, usable = _first_difference(reader, context, "candidate", "reference_a", sequence, switch + 1)
         values.setdefault("first_differing_step", differing)
@@ -3010,6 +3084,33 @@ def _rule_kernel_target(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     return _item("pass", (), reader.evidence, values)
 
 
+def _valid_compile_counts(counts: Any) -> bool:
+    """Require completed, non-negative integer attempt accounting; bool is not a count."""
+    fields = ("compile_attempts", "graphs_compiled", "compile_restarts", "compile_errors")
+    if not isinstance(counts, Mapping) or any(type(counts.get(key)) is not int or counts[key] < 0 for key in fields):
+        return False
+    return counts["compile_attempts"] == sum(counts[key] for key in fields[1:])
+
+
+def _request_compile_activity(reader: _Reader, index: int) -> tuple[str | None, bool]:
+    """Check complete request-boundary counters, including attempts that returned no graph."""
+    if reader.get("/probes/compile/counter_schema") != COMPILE_COUNTER_SCHEMA:
+        return "compile_counter_schema", False
+    before = reader.get(f"/requests/{index}/compile_before")
+    after = reader.get(f"/requests/{index}/compile_after")
+    if not _valid_compile_counts(before) or not _valid_compile_counts(after):
+        # An in-flight attempt at either boundary is not a steady measured phase.
+        return "compile_counters_invalid", False
+    fields = ("compile_attempts", "graphs_compiled", "compile_restarts", "compile_errors")
+    if any(after[key] < before[key] for key in fields):
+        return "compile_counters_invalid", False
+    if before["graphs_compiled"] != reader.get(f"/requests/{index}/graphs_compiled_before") or after[
+        "graphs_compiled"
+    ] != reader.get(f"/requests/{index}/graphs_compiled_after"):
+        return "compile_counters_invalid", False
+    return None, any(after[key] != before[key] for key in fields)
+
+
 def _rule_compiled_graphs(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     """Pass when the blocks were compiled without error and no block call of reference_a or candidate ran eagerly."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
@@ -3027,6 +3128,12 @@ def _rule_compiled_graphs(scheduled: Mapping[str, Any]) -> dict[str, Any]:
         fail.append("not_compiled")
     if reader.get("/probes/compile/compile_errors") != 0:
         fail.append("compile_errors")
+    if any(call.get("error") is not None for call in setup_calls):
+        fail.append("compile_setup_errors")
+    if reader.get("/probes/compile/counter_schema") != COMPILE_COUNTER_SCHEMA:
+        unproven.append("compile_counter_schema")
+    if not _valid_compile_counts(reader.get("/probes/compile")):
+        unproven.append("compile_counters_invalid")
     eager_steps = []
     for request in ("reference_a", "candidate"):
         for sequence in range(context.sequences):
@@ -3050,7 +3157,7 @@ def _rule_compiled_graphs(scheduled: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _rule_shifted_boundary(scheduled: Mapping[str, Any]) -> dict[str, Any]:
-    """Pass when boundary_shift selects as its schedule states, compiles no new graph and runs compiled graphs only."""
+    """Pass when boundary_shift selects as configured, makes no compile attempt and runs compiled graphs only."""
     reader = _Reader(scheduled, SESSION_FILES["scheduled"])
     context = _Scheduled(reader)
     shifted_schedule = reader.get("/config/boundary_shift_schedule", note=False)
@@ -3087,6 +3194,12 @@ def _rule_shifted_boundary(scheduled: Mapping[str, Any]) -> dict[str, Any]:
     values["delta"] = delta
     if delta != 0:
         fail.append("graphs_grew")
+    problem, activity = _request_compile_activity(reader, index)
+    if problem is not None:
+        unproven.append(problem)
+    elif activity and delta == 0:
+        # A restart or failed attempt still invalidates the no-recompile claim.
+        fail.append("compile_attempts_during_boundary_shift")
     # No new graph is evidence only if the shifted request ran compiled code.
     for sequence in range(context.sequences):
         for step in range(context.total_steps):
@@ -3139,7 +3252,10 @@ def _rule_timing(scheduled: Mapping[str, Any]) -> dict[str, Any]:
                 if reader.get(context.step_pointer(request, sequence, step) + "/batch_size") != 1:
                     unproven.append("batch_size")
         before = reader.get(f"/requests/{index}/graphs_compiled_before")
-        if reader.get(f"/requests/{index}/graphs_compiled_after") != before:
+        problem, activity = _request_compile_activity(reader, index)
+        if problem is not None:
+            unproven.append(f"{problem}:{request}")
+        if activity or reader.get(f"/requests/{index}/graphs_compiled_after") != before:
             unproven.append(f"compiled_during_measured_request:{request}")
         # A selection that a transformer runs for the first time in a measured request can be
         # traced again there, and the graph count does not show a trace that compiles no graph.

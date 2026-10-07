@@ -5,7 +5,7 @@ import copy
 import logging
 from collections.abc import Iterable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import numpy as np
 import torch
@@ -2396,7 +2396,10 @@ class HunyuanImage3Pipeline(
         _denoise_step_group republishes the same step and clears it after its forward; the returned
         context manager restores the step, timestep, total and active flag on any exit.
         """
-        timestep = float(state.current_timestep) / state.scheduler.config.num_train_timesteps
+        timestep = (
+            float(cast(torch.Tensor, state.current_timestep))
+            / cast(FlowMatchEulerDiscreteScheduler, state.scheduler).config.num_train_timesteps
+        )
         return request_denoise_progress(state.step_index, state.total_steps, timestep)
 
     def step_scheduler(

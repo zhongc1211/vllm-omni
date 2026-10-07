@@ -57,8 +57,8 @@ def build_request_batch_sampling_params_key(request: OmniDiffusionRequest) -> Re
     key_kwargs["lora_int_id"] = lora_request.lora_int_id if lora_request is not None else None
     from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
 
-    key_kwargs["attention_schedule"] = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
-    return RequestBatchSamplingParamsKey(**key_kwargs)
+    attention_schedule = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
+    return RequestBatchSamplingParamsKey(attention_schedule=attention_schedule, **key_kwargs)
 
 
 class RequestScheduler(BaseScheduler):

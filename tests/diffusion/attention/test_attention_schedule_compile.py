@@ -73,7 +73,13 @@ from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, SkipSoftmaxSpec
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    AttentionSpec,
+    OmniDiffusionConfig,
+    SkipSoftmaxSpec,
+)
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
@@ -227,17 +233,8 @@ def _resolve(*, role, head_size, attention_config=None, role_category=None, allo
     return _RecordingTrtllmBackend, spec
 
 
-def _config(schedule=None):
-    """The od_config fields that Attention construction reads."""
-    return SimpleNamespace(
-        diffusion_attention_config=AttentionConfig(),
-        diffusion_attention_schedule=schedule,
-        diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.DENSE_LEGACY,
-        parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1, sequence_parallel_size=1, ulysses_degree=1),
-        diffusion_kv_cache_dtype=None,
-        diffusion_kv_cache_skip_step_indices=None,
-        diffusion_kv_cache_skip_layer_indices=None,
-    )
+def _config(schedule: AttentionScheduleConfig | None = None) -> OmniDiffusionConfig:
+    return OmniDiffusionConfig(diffusion_attention_schedule=schedule)
 
 
 def _trtllm(threshold, disabled_until_timestep=0.0):
@@ -955,7 +952,8 @@ def test_compiled_step_check_names_the_step_with_a_missing_side():
     # A frame can stop compiling on one side of attention only, for example after too many
     # recompiles. The check counts the graphs before and after attention separately and names the
     # first step in which one side did not run compiled.
-    counter = SimpleNamespace(graphs=[{"sin"}, {"cos"}])
+    counter = _CountingBackend()
+    counter.graphs = [{"sin"}, {"cos"}]
     compiled = _Step(trace=[], executions=[_BLOCKS, _BLOCKS], graphs=2, compiles=0, latents=torch.zeros(1))
     one_sided = _Step(trace=[], executions=[_BLOCKS, 0], graphs=2, compiles=0, latents=torch.zeros(1))
 

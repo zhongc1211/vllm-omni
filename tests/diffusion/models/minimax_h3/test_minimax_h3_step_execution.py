@@ -14,6 +14,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.diffusion.attention.test_attention_schedule_candidates import _make_metadata_candidate
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
 _HIDDEN = 8
@@ -97,8 +100,11 @@ def _sigmas(num_steps: int, shift: float) -> list[float]:
 def _make_state(request_id: str, model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio):
     from vllm_omni.diffusion.models.minimax_h3 import pipeline_minimax_h3 as mod
     from vllm_omni.diffusion.worker.utils import StepRequestState
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    state = StepRequestState(request_id=request_id, sampling=SimpleNamespace())
+    state = StepRequestState(
+        request_id=request_id, sampling=OmniDiffusionSamplingParams(guidance_scale=1.0, true_cfg_scale=4.0)
+    )
     state.latents = video_rows.clone()
     state.timesteps = torch.tensor([1.0 - sigma for sigma in sigmas_video[:-1]], dtype=torch.float32)
     state.step_index = 0
@@ -156,7 +162,7 @@ def test_step_execution_matches_request_mode_denoise_loop(num_steps, mocker):
     model.reset_mock()
     pipeline = _step_pipeline(model)
     state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
-    input_batch = SimpleNamespace(states=(state,))
+    input_batch = InputBatch.make_batch([state])
 
     steps = 0
     while not state.denoise_completed:
@@ -263,7 +269,7 @@ def test_step_execution_matches_request_mode_with_latent_edits():
     state.extra[mod._STEP_AUDIO_EDIT] = audio_edit
     pipeline = _step_pipeline(model)
     while not state.denoise_completed:
-        velocity = pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state])
+        velocity = pipeline.denoise_step(InputBatch.make_batch([state]), states=[state])
         pipeline.step_scheduler(state, velocity)
 
     for name, expected in request_first_call.items():
@@ -318,7 +324,7 @@ def test_batched_step_execution_matches_independent_requests(lock_audio):
     for index in range(len(specs)):
         state = make_state("solo", index)
         while not state.denoise_completed:
-            pipeline.step_scheduler(state, pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state]))
+            pipeline.step_scheduler(state, pipeline.denoise_step(InputBatch.make_batch([state]), states=[state]))
         alone.append((state.latents, state.extra[mod._STEP_AUDIO_ROWS]))
 
     states = [make_state(f"req-{index}", index) for index in range(len(specs))]
@@ -384,7 +390,7 @@ def test_both_modes_publish_denoise_progress_for_gated_attention():
         pipeline = _step_pipeline(model)
         state = _make_state("req-0", model, branch, video_rows, audio_rows, sigmas_video, sigmas_audio)
         while not state.denoise_completed:
-            pipeline.step_scheduler(state, pipeline.denoise_step(SimpleNamespace(states=(state,)), states=[state]))
+            pipeline.step_scheduler(state, pipeline.denoise_step(InputBatch.make_batch([state]), states=[state]))
         step_mode = list(published)
     finally:
         fc._forward_context = original
@@ -416,7 +422,7 @@ def test_mixed_step_batch_leaves_gated_attention_dense():
     original = fc._forward_context
     fc._forward_context = recorder
     try:
-        _step_pipeline(model).denoise_step(SimpleNamespace(states=tuple(states)), states=states)
+        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
     finally:
         fc._forward_context = original
 
@@ -476,11 +482,11 @@ def test_scheduled_mixed_step_batch_runs_each_request_under_its_own_progress():
     states = _mixed_progress_states(model)
     pipeline = _step_pipeline(model)
     with set_forward_context():
-        packed_velocity = pipeline.denoise_step(SimpleNamespace(states=tuple(states)), states=states)
+        packed_velocity = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
         packed_progress = list(model.progress)
         model.progress.clear()
         with bind_attention_schedule(_sparse_schedule()):
-            velocity = pipeline.denoise_step(SimpleNamespace(states=tuple(states)), states=states)
+            velocity = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
             after = _denoise_progress(get_forward_context())
 
     first_sigmas = states[0].extra[mod._STEP_SIGMAS_VIDEO]
@@ -503,7 +509,7 @@ def test_scheduled_step_batch_restores_progress_when_a_request_forward_raises():
     states = _mixed_progress_states(model)
     with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
         with pytest.raises(RuntimeError, match="request forward failed"):
-            _step_pipeline(model).denoise_step(SimpleNamespace(states=tuple(states)), states=states)
+            _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
         after = _denoise_progress(get_forward_context())
 
     assert [progress[0] for progress in model.progress] == [0, 2]
@@ -518,7 +524,7 @@ def test_unscheduled_mixed_step_batch_keeps_one_packed_forward(schedule):
     model = _ProgressRecordingModel()
     states = _mixed_progress_states(model)
     with set_forward_context(), bind_attention_schedule(schedule):
-        _step_pipeline(model).denoise_step(SimpleNamespace(states=tuple(states)), states=states)
+        _step_pipeline(model).denoise_step(InputBatch.make_batch(states), states=states)
 
     assert model.progress == [(None, None, None, False, 2)]
 
@@ -530,7 +536,7 @@ def test_scheduled_single_request_step_batch_keeps_one_forward():
     model = _ProgressRecordingModel()
     state = _mixed_progress_states(model)[1]
     with set_forward_context(), bind_attention_schedule(_sparse_schedule()):
-        _step_pipeline(model).denoise_step(SimpleNamespace(states=(state,)), states=[state])
+        _step_pipeline(model).denoise_step(InputBatch.make_batch([state]), states=[state])
 
     assert model.progress == [(2, float(state.extra[mod._STEP_SIGMAS_VIDEO][2]), 4, True, 1)]
 
@@ -794,7 +800,7 @@ def _schedule_candidate(name: str, *, mask_free=False, prefix_kv_slicing=False, 
             del spec
             return attention_mask
 
-    return SimpleNamespace(backend_cls=_Backend, spec=None)
+    return _make_metadata_candidate(_Backend)
 
 
 def _candidate_rejections(attention, record) -> list[str]:

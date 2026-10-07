@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import set_forward_context
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -133,7 +134,7 @@ def test_attention_uses_schedule_boundary_only_for_scheduled_layers(
     attention._forward_impl = _recorder("impl")
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: compiling)
 
-    config = SimpleNamespace(parallel_config=SimpleNamespace(use_hsdp=use_hsdp))
+    config = OmniDiffusionConfig(parallel_config=DiffusionParallelConfig(use_hsdp=use_hsdp, hsdp_shard_size=1))
     query = torch.empty(1)
     with set_forward_context(omni_diffusion_config=config) if with_context else nullcontext():
         assert Attention.forward(attention, query, query, query) is query

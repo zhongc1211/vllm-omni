@@ -44,9 +44,11 @@ from vllm_omni.diffusion.data import (
     AttentionSpec,
     DiffusionOutput,
     DiffusionRequestAbortedError,
+    OmniDiffusionConfig,
 )
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
+    begin_scheduled_denoise,
     bind_attention_schedule,
     get_forward_context,
     is_forward_context_available,
@@ -57,6 +59,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput, NewRequestData
 from vllm_omni.diffusion.sched.request_scheduler import RequestScheduler, build_request_batch_sampling_params_key
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.errors import client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, absorb_attention_schedule_extra_args
 
@@ -350,15 +353,21 @@ def test_ring_attention_applies_the_step_check_before_delegating(attention_env):
 
 
 def test_batch_key_separates_ranges_and_matches_equal_ranges():
-    left = SimpleNamespace(
+    left = OmniDiffusionRequest(
+        prompt="left",
+        request_id="left",
         sampling_params=OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": 2, "profile": "sparse"}]),
         batch_compatibility_key=None,
     )
-    right = SimpleNamespace(
+    right = OmniDiffusionRequest(
+        prompt="right",
+        request_id="right",
         sampling_params=OmniDiffusionSamplingParams(attention_schedule=[{"start": 2, "end": 4, "profile": "sparse"}]),
         batch_compatibility_key=None,
     )
-    same = SimpleNamespace(
+    same = OmniDiffusionRequest(
+        prompt="same",
+        request_id="same",
         sampling_params=OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": 2, "profile": "sparse"}]),
         batch_compatibility_key=None,
     )
@@ -369,10 +378,12 @@ def test_batch_key_separates_ranges_and_matches_equal_ranges():
 
 def test_validation_rejects_unknown_profile():
     service = _service()
-    request = SimpleNamespace(
-        sampling_params=OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": 1, "profile": "missing"}])
+    request = OmniDiffusionRequest(
+        prompt="unknown profile",
+        request_id="unknown-profile",
+        sampling_params=OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": 1, "profile": "missing"}]),
     )
-    od_config = SimpleNamespace(diffusion_attention_schedule=service)
+    od_config = OmniDiffusionConfig(diffusion_attention_schedule=service)
 
     with pytest.raises(ValueError, match="unknown profile"):
         validate_request_attention_schedule(request, od_config)
@@ -438,7 +449,7 @@ def test_sampling_clone_keeps_schedule_and_does_not_alias_source():
 
 def test_scheduler_admits_valid_request_and_rejects_invalid():
     scheduler = RequestScheduler()
-    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=_service())
+    scheduler.od_config = OmniDiffusionConfig(diffusion_attention_schedule=_service())
     valid = OmniDiffusionRequest(
         prompt="ok",
         request_id="ok",
@@ -456,11 +467,6 @@ def test_scheduler_admits_valid_request_and_rejects_invalid():
     assert "bad" not in scheduler._request_states
     # A client input error must reach HTTP as 400, not as a server error.
     assert client_error_metadata(excinfo.value) == (400, "invalid_attention_schedule")
-
-
-def _batch_key(params):
-    state = SimpleNamespace(sampling_params=params, batch_compatibility_key=None)
-    return build_request_batch_sampling_params_key(state)
 
 
 def _late_schedule_request(request_id, schedule, *, typed=None):
@@ -487,13 +493,14 @@ def test_scheduler_absorbs_schedule_written_into_extra_args_after_construction(s
     # clone() does not re-run __post_init__, so without admission-time absorption the typed
     # field keeps its old value and the request silently runs a schedule it did not ask for.
     scheduler = RequestScheduler()
-    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=_service())
+    scheduler.od_config = OmniDiffusionConfig(diffusion_attention_schedule=_service())
     request = _late_schedule_request("late", schedule, typed=typed)
     assert "attention_schedule" in request.sampling_params.extra_args
 
     assert scheduler.add_request(request) == "late"
 
-    admitted = scheduler._request_states["late"].req.sampling_params
+    admitted_request = scheduler._request_states["late"].req
+    admitted = admitted_request.sampling_params
     assert admitted.attention_schedule == expected
     assert admitted.extra_args == {"other": 1}
     # The batch key reads the typed field, so the schedule is the only field that separates it from an
@@ -502,10 +509,11 @@ def test_scheduler_absorbs_schedule_written_into_extra_args_after_construction(s
         prompt="inherit", request_id="inherit", sampling_params=OmniDiffusionSamplingParams(extra_args={"other": 1})
     )
     assert scheduler.add_request(inheriting) == "inherit"
-    inherited_key = _batch_key(scheduler._request_states["inherit"].req.sampling_params)
+    inherited_key = build_request_batch_sampling_params_key(scheduler._request_states["inherit"].req)
     assert inherited_key.attention_schedule is None
-    assert _batch_key(admitted).attention_schedule == expected
-    assert dataclasses.replace(_batch_key(admitted), attention_schedule=None) == inherited_key
+    admitted_key = build_request_batch_sampling_params_key(admitted_request)
+    assert admitted_key.attention_schedule == expected
+    assert dataclasses.replace(admitted_key, attention_schedule=None) == inherited_key
 
 
 @pytest.mark.parametrize(
@@ -520,7 +528,7 @@ def test_scheduler_absorbs_schedule_written_into_extra_args_after_construction(s
 )
 def test_scheduler_rejects_invalid_late_schedule_as_client_error(schedule, typed, message):
     scheduler = RequestScheduler()
-    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=_service())
+    scheduler.od_config = OmniDiffusionConfig(diffusion_attention_schedule=_service())
 
     with pytest.raises(InvalidAttentionScheduleError, match=message) as excinfo:
         scheduler.add_request(_late_schedule_request("bad", schedule, typed=typed))
@@ -533,7 +541,7 @@ def test_scheduler_rejects_invalid_late_schedule_as_client_error(schedule, typed
 def test_different_ranges_are_not_scheduled_together_and_ids_stay_put():
     scheduler = RequestScheduler()
     scheduler.max_num_running_reqs = 2
-    scheduler.od_config = SimpleNamespace(diffusion_attention_schedule=_service())
+    scheduler.od_config = OmniDiffusionConfig(diffusion_attention_schedule=_service())
     first = OmniDiffusionRequest(
         prompt="a",
         request_id="req-a",
@@ -557,9 +565,12 @@ def test_different_ranges_are_not_scheduled_together_and_ids_stay_put():
 def test_batch_schedule_requires_one_identity():
     first = OmniDiffusionSamplingParams(attention_schedule=[{"start": 0, "end": 1, "profile": "sparse"}])
     second = OmniDiffusionSamplingParams(attention_schedule=[{"start": 1, "end": 2, "profile": "sparse"}])
-    states = [SimpleNamespace(sampling=first), SimpleNamespace(sampling=second)]
+    states = [
+        StepRequestState(request_id="first", sampling=first),
+        StepRequestState(request_id="second", sampling=second),
+    ]
     with pytest.raises(ValueError, match="batch"):
-        resolve_batch_attention_schedule(states, SimpleNamespace(diffusion_attention_schedule=_service()))
+        resolve_batch_attention_schedule(states, OmniDiffusionConfig(diffusion_attention_schedule=_service()))
 
 
 # Runner integration: the real runner binds the schedule, a fake pipeline
@@ -639,8 +650,9 @@ class _PublishingRequestPipeline(DenoiseProgressMixin):
 
     supports_request_batch = True
 
-    def __init__(self, layer, *, fail_step=None, error=None):
+    def __init__(self, layer, *, fail_step=None, error=None, actual_steps=None):
         self.layer = layer
+        self.actual_steps = actual_steps
         self.fail_step = fail_step
         self.error = error
         self.selected: list[tuple[Any, ...]] = []
@@ -651,8 +663,11 @@ class _PublishingRequestPipeline(DenoiseProgressMixin):
 
     def forward(self, batch):
         self.bound_schedules.append(get_forward_context().attention_schedule)
-        total = batch.requests[0].sampling_params.num_inference_steps
+        total = self.actual_steps
+        if total is None:
+            total = batch.requests[0].sampling_params.num_inference_steps
         self._select("encode")
+        begin_scheduled_denoise(total)
         for step in range(total):
             self.record_denoise_step(step, total_steps=total)
             if step == self.fail_step:
@@ -1024,7 +1039,7 @@ def _load_model(monkeypatch, pipeline, *, schedule, cache_backend=None, model_cl
     runner.pipeline = None
     runner.cache_backend = None
     runner.offload_backend = None
-    runner.od_config = SimpleNamespace(
+    runner.od_config = OmniDiffusionConfig(
         enable_cpu_offload=False,
         enable_layerwise_offload=False,
         cache_backend=cache_backend,
@@ -1114,3 +1129,34 @@ def test_startup_accepts_default_schedule_when_the_model_disables_cache_accelera
 
     assert runner.od_config.cache_backend is None
     assert runner.cache_backend is None
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_request_runner_returns_400_for_actual_schedule_bounds(attention_env, runner_platform, batch_size):
+    config = _runner_config(_service())
+    layer = attention_env.build(config)
+    pipeline = _PublishingRequestPipeline(layer, actual_steps=4)
+    runner = _make_runner(pipeline, config)
+    requests = [
+        _request(f"req-{i}", schedule=[{"start": 0, "end": 6, "profile": "dense"}], steps=8) for i in range(batch_size)
+    ]
+
+    if batch_size == 1:
+        outputs = [runner.execute_model(requests[0])]
+    else:
+        result = runner.execute_model_batch(_new_requests(*requests), config)
+        assert [item.request_id for item in result.runner_outputs] == [req.request_id for req in requests]
+        outputs = [item.result for item in result.runner_outputs]
+
+    for output in outputs:
+        assert "exceeds total_steps" in output.error
+        assert output.error_status_code == 400
+        assert output.error_type == "invalid_attention_schedule"
+    assert len(pipeline.bound_schedules) == 1
+    assert len(pipeline.selected) == 1
+    assert pipeline.selected[0][0] == "encode"
+    assert is_forward_context_available() is False
+
+    runner.pipeline = _PublishingRequestPipeline(layer)
+    assert runner.execute_model(_request("healthy", schedule=[])).error is None
+    assert is_forward_context_available() is False

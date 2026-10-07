@@ -148,7 +148,7 @@ class UniProcDiffusionExecutor(DiffusionExecutor):
                         request_id=new_req.request_id,
                         step_index=None,
                         finished=True,
-                        result=DiffusionOutput(error=str(exc)),
+                        result=DiffusionOutput.from_exception(exc),
                     )
                 )
         return BatchRunnerOutput.from_list(runner_outputs)

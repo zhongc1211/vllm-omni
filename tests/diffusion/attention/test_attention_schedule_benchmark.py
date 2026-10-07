@@ -39,7 +39,16 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend, AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.trtllm_attn import QuantConfig, SkipSoftmaxConfig
+from vllm_omni.diffusion.attention.layer import _PreparedCandidate
 from vllm_omni.diffusion.attention.schedule import parse_attention_schedule, select_attention_profile
+from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.forward_context import ForwardContext
+from vllm_omni.diffusion.worker.input_batch import InputBatch
+from vllm_omni.diffusion.worker.utils import StepRequestState
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -191,6 +200,15 @@ def _make_output(directory: Path, session: str, name: str, tag: str) -> dict[str
     }
 
 
+def _compile_counts(graphs: int, *, restarts: int = 0, errors: int = 0) -> dict[str, int]:
+    return {
+        "compile_attempts": graphs + restarts + errors,
+        "graphs_compiled": graphs,
+        "compile_restarts": restarts,
+        "compile_errors": errors,
+    }
+
+
 def make_request(
     config: dict[str, Any],
     session: str,
@@ -253,6 +271,8 @@ def make_request(
         "wall_seconds": 4.0,
         "graphs_compiled_before": compiled[0],
         "graphs_compiled_after": compiled[1],
+        "compile_before": _compile_counts(compiled[0]),
+        "compile_after": _compile_counts(compiled[1]),
         "sequences": [
             {
                 "source": bench.SEQUENCE_SOURCES[(family, mode)],
@@ -335,9 +355,9 @@ def make_session(
             "installed": installed,
             "compile": {
                 "mechanism": bench.COMPILE_MECHANISM,
+                "counter_schema": bench.COMPILE_COUNTER_SCHEMA,
                 "setup_calls": [setup_call],
-                "graphs_compiled": 5,
-                "compile_errors": 0,
+                **_compile_counts(5),
             },
             "kernel": kernel,
             "outside_requests": {"sequences": 0, "steps": 0},
@@ -826,8 +846,8 @@ def test_environment_has_no_secrets(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _outputs(image: Any, error: Any = None) -> list[Any]:
-    return [SimpleNamespace(images=[image], error=error)]
+def _outputs(image: Any, error: Any = None) -> list[OmniRequestOutput]:
+    return [OmniRequestOutput(images=[image], error=error)]
 
 
 def test_extract_frames_layouts():
@@ -857,7 +877,7 @@ def test_extract_frames_layouts():
 @pytest.mark.parametrize(
     ("outputs", "message"),
     [
-        pytest.param([SimpleNamespace(images=[], error=None)], "has no images", id="no-images"),
+        pytest.param([OmniRequestOutput(images=[])], "has no images", id="no-images"),
         pytest.param(_outputs(torch.zeros(1), error="out of memory"), "returned an error", id="request-error"),
         pytest.param(_outputs({"audio": torch.zeros(1, 16)}), "holds no video", id="audio-only"),
         pytest.param(_outputs(torch.zeros(4, 6, 3)), "got an array of shape", id="one-image"),
@@ -1372,7 +1392,7 @@ def _service_ran_eager(scheduled: dict[str, Any]) -> None:
 
 
 def _compile_error_recorded(scheduled: dict[str, Any]) -> None:
-    scheduled["probes"]["compile"]["compile_errors"] = 1
+    scheduled["probes"]["compile"].update(_compile_counts(5, errors=1))
 
 
 def _second_model_not_compiled(scheduled: dict[str, Any]) -> None:
@@ -1871,6 +1891,8 @@ def test_shifted_boundary_passes_when_the_shifted_schedule_adds_no_graph(make_se
 def test_shifted_boundary(make_sessions, pointer, value, status, reasons):
     sessions, directory = make_sessions("C1", switch=3)
     _put(sessions["scheduled"], pointer, value)
+    if pointer.endswith("/graphs_compiled_after"):
+        _put(sessions["scheduled"], pointer.rsplit("/", 1)[0] + "/compile_after", _compile_counts(value))
 
     result = _evaluate(sessions, directory)
 
@@ -1889,6 +1911,121 @@ def test_shifted_boundary_reports_the_added_graphs_and_the_wrong_steps(make_sess
     assert (item["status"], item["reasons"]) == ("fail", ["graphs_grew", "selection_mismatch"])
     assert item["values"]["delta"] == 2
     assert item["values"]["steps"] == [{"sequence": 0, "step": 3, "problem": "expected_baseline"}]
+
+
+def test_tensorify_restarts_before_measurement_do_not_hide_failures(make_sessions):
+    sessions, directory = make_sessions("C5")
+    scheduled = sessions["scheduled"]
+    scheduled["probes"]["compile"].update(_compile_counts(5, restarts=7))
+    for index, request in enumerate(scheduled["requests"]):
+        request["compile_before"] = _compile_counts(0) if index == _WU else _compile_counts(5, restarts=7)
+        request["compile_after"] = _compile_counts(5, restarts=7)
+
+    result = _evaluate(sessions, directory)
+    assert result["status"] == "success", _not_passing(result)
+    assert result["items"]["shifted_boundary"]["status"] == "pass"
+
+    # Reclassifying a restart must not weaken the strict output comparison.
+    sessions["plain"]["requests"][1]["sequences"][0]["steps"][0]["digests"]["noise_pred"] = _digest("different")
+    result = _evaluate(sessions, directory)
+    assert result["items"]["no_schedule"]["status"] == "fail"
+    assert result["status"] == "not_success"
+
+
+@pytest.mark.parametrize("kind", ["restarts", "errors"])
+@pytest.mark.parametrize("index", [_RA, _RB, _CA, _BS])
+def test_attempt_without_a_new_graph_invalidates_measured_requests(make_sessions, kind, index):
+    sessions, directory = make_sessions("C5")
+    scheduled = sessions["scheduled"]
+    counts = _compile_counts(5, **{kind: 1})
+    scheduled["probes"]["compile"].update(counts)
+    for position, request in enumerate(scheduled["requests"]):
+        if position >= index:
+            request["compile_after"] = dict(counts)
+        if position > index:
+            request["compile_before"] = dict(counts)
+
+    result = _evaluate(sessions, directory)
+    if index == _BS:
+        item = result["items"]["shifted_boundary"]
+        assert (item["status"], item["reasons"]) == ("fail", ["compile_attempts_during_boundary_shift"])
+        assert item["values"]["delta"] == 0
+        assert bench.evaluate_matrix({"C5": result})["status"] == "not_success"
+    else:
+        item = result["items"]["timing"]
+        assert item["status"] == "not_proven"
+        assert f"compiled_during_measured_request:{scheduled['requests'][index]['name']}" in item["reasons"]
+        assert result["report"]["seconds_per_step"] == {}
+        assert result["status"] == "not_success"
+    if kind == "errors":
+        assert "compile_errors" in result["items"]["compiled_graphs"]["reasons"]
+
+
+@pytest.mark.parametrize("phase", ["compile_before", "compile_after"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        _DROP,
+        None,
+        {},
+        _compile_counts(5) | {"compile_attempts": True},
+        _compile_counts(5) | {"compile_restarts": -1},
+        _compile_counts(5) | {"compile_attempts": 6},
+        _compile_counts(5) | {"compile_errors": 0.0},
+    ],
+)
+@pytest.mark.parametrize(("index", "item"), [(_CA, "timing"), (_BS, "shifted_boundary")])
+def test_missing_or_unfinished_compile_counters_do_not_prove_a_steady_request(make_sessions, phase, value, index, item):
+    sessions, directory = make_sessions("C1")
+    _put(sessions["scheduled"], f"/requests/{index}/{phase}", value)
+
+    result = _evaluate(sessions, directory)["items"][item]
+    assert result["status"] == "not_proven"
+    assert any("compile_" in reason for reason in result["reasons"])
+
+
+@pytest.mark.parametrize("index", [_CA, _BS])
+def test_compile_counters_cannot_decrease_or_disagree_with_graph_counts(make_sessions, index):
+    sessions, directory = make_sessions("C1")
+    request = sessions["scheduled"]["requests"][index]
+    item = "timing" if index == _CA else "shifted_boundary"
+    request["compile_before"] = _compile_counts(5, restarts=1)
+    assert _evaluate(sessions, directory)["items"][item]["status"] == "not_proven"
+    request["compile_before"] = _compile_counts(4)
+    assert _evaluate(sessions, directory)["items"][item]["status"] == "not_proven"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("counter_schema", _DROP),
+        ("counter_schema", "unknown"),
+        ("compile_attempts", _DROP),
+        ("compile_attempts", 6),
+        ("compile_attempts", True),
+        ("compile_restarts", -1),
+    ],
+)
+def test_compile_summary_requires_complete_attempt_accounting(make_sessions, field, value):
+    sessions, directory = make_sessions("C1")
+    _put(sessions["scheduled"], "/probes/compile/" + field, value)
+    result = _evaluate(sessions, directory)
+    assert result["items"]["compiled_graphs"]["status"] == "not_proven"
+    assert result["status"] == "not_success"
+
+
+@pytest.mark.parametrize("failure", ["eager", "setup", "backend"])
+def test_restarts_do_not_excuse_eager_execution_or_compile_failures(make_sessions, failure):
+    sessions, directory = make_sessions("C1")
+    scheduled = sessions["scheduled"]
+    scheduled["probes"]["compile"].update(_compile_counts(5, restarts=7, errors=int(failure == "backend")))
+    if failure == "eager":
+        _every_block_call_eager(scheduled)
+    elif failure == "setup":
+        scheduled["probes"]["compile"]["setup_calls"][0]["error"] = "RuntimeError: retry limit reached"
+    result = _evaluate(sessions, directory)
+    assert result["items"]["compiled_graphs"]["status"] == "fail"
+    assert result["status"] == "not_success"
 
 
 def test_timing_report_holds_raw_samples_and_medians(make_sessions):
@@ -1935,6 +2072,8 @@ def test_timing_report_holds_raw_samples_and_medians(make_sessions):
 def test_timing_requires_recorded_steady_phases(make_sessions, pointer, value, reason):
     sessions, directory = make_sessions("C1")
     _put(sessions["scheduled"], pointer, value)
+    if pointer.endswith("/graphs_compiled_after"):
+        _put(sessions["scheduled"], pointer.rsplit("/", 1)[0] + "/compile_after", _compile_counts(value))
 
     result = _evaluate(sessions, directory)
 
@@ -2226,6 +2365,7 @@ def test_matrix_rejects_one_failed_shifted_boundary(make_sessions):
         if combination == "C5":
             # The shifted schedule compiled two more graphs on this combination.
             _put(sessions["scheduled"], f"/requests/{_BS}/graphs_compiled_after", 7)
+            _put(sessions["scheduled"], f"/requests/{_BS}/compile_after", _compile_counts(7))
         results[combination] = _evaluate(sessions, directory)
         assert results[combination]["status"] == "success", _not_passing(results[combination])
 
@@ -2355,14 +2495,17 @@ def test_recorder_step_and_block_accounting():
 
 def test_recorder_sequence_totals_and_graph_counts():
     recorder = bench.Recorder(clock=_Clock())
+    recorder.note_compile_attempt()
     assert recorder.note_graph_compiled() == 0
 
     recorder.begin_request("warmup")
     recorder.begin_sequence("source", None, {})
     recorder.begin_step(0)
+    recorder.note_compile_attempt()
     assert recorder.note_graph_compiled() == 1
     recorder.end_step()
     recorder.end_sequence({"x": 1})
+    recorder.note_compile_attempt()
     recorder.note_compile_error()
     assert recorder.note_setup("Model", 2, ["Block"], {"dynamic": "True"}) == 0
     captured = recorder.end_request()
@@ -2371,7 +2514,9 @@ def test_recorder_sequence_totals_and_graph_counts():
     [sequence] = captured["sequences"]
     assert (sequence["total_steps"], sequence["incomplete"], sequence["final"]) == (1, False, {"x": 1})
     assert sequence["steps"][0]["compile"]["graphs_compiled"] == 1
-    assert recorder.totals() == {"setup_calls": 1, "graphs_compiled": 2, "graph_execs": 0, "compile_errors": 1}
+    assert recorder.totals() == {"setup_calls": 1, "graph_execs": 0, **_compile_counts(2, errors=1)}
+    assert captured["compile_before"] == _compile_counts(1)
+    assert captured["compile_after"] == _compile_counts(2, errors=1)
     assert recorder.probes_snapshot()["setup_calls"] == [
         {
             "index": 0,
@@ -2719,8 +2864,14 @@ class _FakeH3StepPipeline:
         return "decoded"
 
 
-def _h3_state() -> SimpleNamespace:
-    return SimpleNamespace(latents=torch.zeros(2, 4), extra={"audio_rows": torch.ones(1, 4)}, step_index=0)
+def _h3_state(request_id: str = "h3-benchmark") -> StepRequestState:
+    return StepRequestState(
+        request_id=request_id,
+        sampling=OmniDiffusionSamplingParams(num_inference_steps=3),
+        latents=torch.zeros(2, 4),
+        timesteps=torch.tensor([3, 2, 1]),
+        extra={"audio_rows": torch.ones(1, 4)},
+    )
 
 
 def test_h3_step_adapter(monkeypatch):
@@ -2736,7 +2887,7 @@ def test_h3_step_adapter(monkeypatch):
         state = _h3_state()
         recorder.begin_request(name)
         for _ in range(steps):
-            assert pipeline.denoise_step(SimpleNamespace(states=[state])) == "noise"
+            assert pipeline.denoise_step(InputBatch.make_batch([state])) == "noise"
             assert pipeline.step_scheduler(state) == "scheduled"
         assert pipeline.post_decode(state) == "decoded"
         return recorder.end_request()
@@ -2750,10 +2901,10 @@ def test_h3_step_adapter(monkeypatch):
         # A state at step 0 opens a new sequence even when post_decode did not close the last one.
         recorder.begin_request("interrupted")
         state = _h3_state()
-        pipeline.denoise_step(SimpleNamespace(states=[state]))
+        pipeline.denoise_step(InputBatch.make_batch([state]))
         pipeline.step_scheduler(state)
         other = _h3_state()
-        pipeline.denoise_step(None, states=[other, _h3_state()])
+        pipeline.denoise_step(None, states=[other, _h3_state("other-h3-request")])
         pipeline.step_scheduler(other)
         interrupted = recorder.end_request()
 
@@ -2858,6 +3009,95 @@ def test_wan_request_adapter(monkeypatch):
     assert (second["total_steps"], len(second["steps"]), second["final"]) == (2, 2, None)
 
 
+@pytest.mark.parametrize("batch_size", [None, 1, 2])
+@pytest.mark.parametrize("guided", [False, True])
+@pytest.mark.parametrize("positional", [False, True])
+def test_wan_probe_captures_conditioning_without_changing_prediction_inputs(
+    monkeypatch, guided, positional, batch_size
+):
+    latents = torch.full((batch_size or 1, 4), 8.0)
+    positive_encoding = torch.ones(1, 2, 4)
+    negative_encoding = -torch.ones(1, 2, 4)
+    timesteps = torch.tensor([9, 3])
+    seen = []
+
+    class Pipeline(_FakeWanPipeline):
+        def diffuse(self, latents, timesteps, as_tensor=True):
+            for timestep in timesteps:
+                timestep_input = timestep if batch_size is None else timestep.expand(batch_size)
+                self.expected_timestep = timestep_input
+                if batch_size is not None:
+                    assert timestep_input.stride() == (0,)
+                positive = {
+                    "hidden_states": latents,
+                    "timestep": timestep_input,
+                    "encoder_hidden_states": positive_encoding,
+                    "current_model": self.transformer,
+                }
+                negative = (
+                    {
+                        "hidden_states": latents,
+                        "timestep": timestep_input,
+                        "encoder_hidden_states": negative_encoding,
+                        "current_model": self.transformer,
+                    }
+                    if guided
+                    else None
+                )
+                self.expected_arguments = (positive, negative)
+                if positional:
+                    predicted = self.predict_noise_maybe_with_cfg(guided, 3.0, positive, negative)
+                else:
+                    predicted = self.predict_noise_maybe_with_cfg(
+                        do_true_cfg=guided, true_cfg_scale=3.0, positive_kwargs=positive, negative_kwargs=negative
+                    )
+                latents = latents - predicted[0]
+            return latents
+
+        def predict_noise_maybe_with_cfg(self, do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs=None):
+            assert positive_kwargs is self.expected_arguments[0]
+            assert negative_kwargs is self.expected_arguments[1]
+            assert positive_kwargs["encoder_hidden_states"] is positive_encoding
+            assert positive_kwargs["timestep"] is self.expected_timestep
+            if batch_size is not None:
+                assert positive_kwargs["timestep"].stride() == (0,)
+            if guided:
+                assert negative_kwargs["encoder_hidden_states"] is negative_encoding
+                assert negative_kwargs["timestep"] is self.expected_timestep
+            seen.append((do_true_cfg, true_cfg_scale))
+            return super().predict_noise_maybe_with_cfg(do_true_cfg, true_cfg_scale, positive_kwargs, negative_kwargs)
+
+    module = _fake_module(monkeypatch, "_fake_bench_wan_inputs", Pipeline=Pipeline)
+    recorder, pipeline = bench.Recorder(), Pipeline()
+    with bench.PatchSet() as patches:
+        bench.install_wan_request_adapter(patches, recorder, module_path=module.__name__, class_name="Pipeline")
+        recorder.begin_request("plain")
+        result = pipeline.diffuse(latents, timesteps)
+        captured = recorder.end_request()
+
+    assert torch.equal(result, latents * 0.25)
+    assert torch.equal(positive_encoding, torch.ones(1, 2, 4))
+    assert torch.equal(negative_encoding, -torch.ones(1, 2, 4))
+    assert torch.equal(timesteps, torch.tensor([9, 3]))
+    assert seen == [(guided, 3.0)] * 2
+    steps = captured["sequences"][0]["steps"]
+    for index, step in enumerate(steps):
+        digests = step["digests"]
+        expected_timestep = (
+            timesteps[index]
+            if batch_size is None
+            else torch.full((batch_size,), int(timesteps[index]), dtype=timesteps.dtype)
+        )
+        assert digests["positive_timestep"] == bench.tensor_digest(expected_timestep)
+        assert digests["positive_encoder_hidden_states"] == bench.tensor_digest(positive_encoding)
+        if guided:
+            assert digests["negative_timestep"] == digests["positive_timestep"]
+            assert digests["negative_encoder_hidden_states"] == bench.tensor_digest(negative_encoding)
+            assert digests["negative_latent_in"] == digests["latent_in"]
+        else:
+            assert not any(key.startswith("negative_") for key in digests)
+
+
 def test_wan_request_adapter_requires_the_parameters(monkeypatch):
     class Pipeline(_FakeCfgMixin):
         def diffuse(self, latents):
@@ -2871,15 +3111,58 @@ def test_wan_request_adapter_requires_the_parameters(monkeypatch):
     assert patches.installed == []
 
 
-def _backend(name: str) -> SimpleNamespace:
-    return SimpleNamespace(get_name=lambda: name)
+class _ProbeAttentionImpl(AttentionImpl[AttentionMetadata]):
+    """Attention metadata for the probe; execution belongs to the fake layer."""
+
+    def __init__(self, *, quant: QuantConfig | None = None) -> None:
+        self.quant = quant or QuantConfig()
+        self.skip = SkipSoftmaxConfig()
+
+    def forward(self, *args, **kwargs):
+        raise AssertionError("probe fixture must not execute attention")
+
+
+def _backend(name: str) -> type[AttentionBackend]:
+    class _Backend(AttentionBackend):
+        @staticmethod
+        def get_name() -> str:
+            return name
+
+        @staticmethod
+        def get_impl_cls() -> type[AttentionImpl]:
+            return _ProbeAttentionImpl
+
+        @staticmethod
+        def get_metadata_cls() -> type[AttentionMetadata]:
+            return AttentionMetadata
+
+        @staticmethod
+        def get_builder_cls():
+            return None
+
+        @staticmethod
+        def get_supported_head_sizes() -> list[int]:
+            return []
+
+    return _Backend
+
+
+def _probe_candidate(impl: _ProbeAttentionImpl) -> _PreparedCandidate:
+    return _PreparedCandidate(
+        backend_cls=_backend("TRTLLM_ATTN"),
+        spec=None,
+        impl_cls=_ProbeAttentionImpl,
+        impl=impl,
+        backend_explicit=False,
+        backend_pref=None,
+    )
 
 
 class _FakeAttentionLayer:
     """A layer with the attributes the attention probe reads."""
 
     def __init__(self, *, configured: bool = True) -> None:
-        self.attention = SimpleNamespace(name="dense")
+        self.attention = _ProbeAttentionImpl()
         self.attn_backend = _backend("SDPA")
         self._schedule_configured = configured
         self._schedule_candidates: dict[str, Any] = {}
@@ -2896,9 +3179,9 @@ class _FakeAttentionLayer:
         return ("ran", query, key)
 
 
-def _fake_attention_modules(monkeypatch) -> SimpleNamespace:
+def _fake_attention_modules(monkeypatch) -> ForwardContext:
     """Register a fake attention layer module and a fake forward-context module; return the context."""
-    context = SimpleNamespace(denoise_step_idx=0)
+    context = ForwardContext(denoise_step_idx=0)
     layer_module = _fake_module(monkeypatch, "_fake_bench_attention_layer", Attention=_FakeAttentionLayer)
     context_module = _fake_module(
         monkeypatch,
@@ -2915,9 +3198,7 @@ def test_attention_probe(monkeypatch):
     context = _fake_attention_modules(monkeypatch)
     original = vars(_FakeAttentionLayer)["_run_local_attention"]
     recorder = bench.Recorder()
-    approximate = SimpleNamespace(
-        quant=SimpleNamespace(enabled=True), skip=SimpleNamespace(enabled=False, configured=False)
-    )
+    approximate = _ProbeAttentionImpl(quant=QuantConfig(dtype_qk="fp8_e4m3"))
 
     with bench.PatchSet() as patches:
         bench.install_attention_probe(patches, recorder)
@@ -2929,9 +3210,9 @@ def test_attention_probe(monkeypatch):
 
         shared = _FakeAttentionLayer()
         shared._schedule_candidates = {
-            "late": SimpleNamespace(impl=approximate),
-            "early": SimpleNamespace(impl=approximate),
-            "other": SimpleNamespace(impl=object()),
+            "late": _probe_candidate(approximate),
+            "early": _probe_candidate(approximate),
+            "other": _probe_candidate(_ProbeAttentionImpl()),
         }
         shared.selected = (approximate, _backend("TRTLLM_ATTN"), None)
         shared._run_local_attention("q")
@@ -3337,6 +3618,138 @@ def _inductor_skip_reason() -> str | None:
     return None
 
 
+@pytest.fixture
+def fake_compiler(monkeypatch):
+    class FakeRestartError(Exception):
+        pass
+
+    class FakeTensorifyError(FakeRestartError):
+        pass
+
+    exceptions = _fake_module(
+        monkeypatch,
+        "torch._dynamo.exc",
+        RestartAnalysis=FakeRestartError,
+        TensorifyScalarRestartAnalysis=FakeTensorifyError,
+    )
+    state = SimpleNamespace(outcomes=[], calls=[], executions=[], output=object())
+
+    def graph(*args, **kwargs):
+        state.executions.append((args, kwargs))
+        return state.output
+
+    setattr(graph, "marker", object())
+    setattr(graph, "_torchdynamo_test", True)
+    setattr(graph, "__wrapped__", object())
+
+    class Wrapper:
+        def __call__(self, *args, **kwargs):
+            state.calls.append((self, args, kwargs))
+            outcome = state.outcomes.pop(0) if state.outcomes else graph
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(torch, "_TorchCompileInductorWrapper", Wrapper)
+    state.wrapper = Wrapper
+    state.original = Wrapper.__call__
+    state.exceptions = exceptions
+    state.restart = FakeTensorifyError
+    state.graph = graph
+    return state
+
+
+def test_compile_probe_rethrows_tensorify_restart_and_counts_the_successful_retry(fake_compiler):
+    state = fake_compiler
+    exception = state.restart("tensorify this scalar")
+    state.outcomes = [exception, state.graph]
+    compiler, recorder = state.wrapper(), bench.Recorder()
+    inputs, options = object(), object()
+    recorder.begin_request("warmup")
+    with bench.PatchSet() as patches:
+        bench.install_compile_probe(patches, recorder)
+        with pytest.raises(state.restart) as raised:
+            compiler(inputs, options=options)
+        assert raised.value is exception
+        assert recorder.totals() == {"setup_calls": 0, "graph_execs": 0, **_compile_counts(0, restarts=1)}
+        compiled = compiler(inputs, options=options)
+        # Installing the probe must not execute the graph or change call arguments.
+        assert state.executions == []
+        assert state.calls == [(compiler, (inputs,), {"options": options})] * 2
+        assert compiled.marker is state.graph.marker
+        assert not hasattr(compiled, "_torchdynamo_test")
+        assert not hasattr(compiled, "__wrapped__")
+        assert compiled(inputs, options=options) is state.output
+    captured = recorder.end_request()
+    assert state.wrapper.__call__ is state.original
+    assert recorder.totals() == {"setup_calls": 0, "graph_execs": 1, **_compile_counts(1, restarts=1)}
+    assert captured["compile_before"] == _compile_counts(0)
+    assert captured["compile_after"] == _compile_counts(1, restarts=1)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["ordinary", "unknown-restart", "same-name", "missing-module", "missing-type", "invalid-type", "not-exception"],
+)
+def test_compile_probe_retains_errors_it_cannot_classify(fake_compiler, monkeypatch, kind):
+    state = fake_compiler
+    exception = RuntimeError("backend failed")
+    if kind == "unknown-restart":
+        exception = state.exceptions.RestartAnalysis("other restart")
+    elif kind == "same-name":
+        exception = type("TensorifyScalarRestartAnalysis", (Exception,), {})("unrelated type")
+    elif kind == "missing-module":
+        exception = state.restart("module unavailable")
+        monkeypatch.delitem(sys.modules, "torch._dynamo.exc")
+    elif kind == "missing-type":
+        exception = state.restart("type unavailable")
+        monkeypatch.delattr(state.exceptions, "TensorifyScalarRestartAnalysis")
+    elif kind == "invalid-type":
+        monkeypatch.setattr(state.exceptions, "TensorifyScalarRestartAnalysis", "not a class")
+    elif kind == "not-exception":
+        monkeypatch.setattr(state.exceptions, "TensorifyScalarRestartAnalysis", object)
+    state.outcomes = [exception]
+    recorder = bench.Recorder()
+    with bench.PatchSet() as patches:
+        bench.install_compile_probe(patches, recorder)
+        with pytest.raises(type(exception)) as raised:
+            state.wrapper()()
+    assert raised.value is exception
+    assert recorder.totals() == {"setup_calls": 0, "graph_execs": 0, **_compile_counts(0, errors=1)}
+    assert state.wrapper.__call__ is state.original
+
+
+def test_compile_probe_recognizes_a_type_loaded_after_probe_installation(fake_compiler, monkeypatch):
+    monkeypatch.delitem(sys.modules, "torch._dynamo.exc")
+    exception = fake_compiler.restart("loaded during compilation")
+    fake_compiler.outcomes = [exception]
+    recorder = bench.Recorder()
+    with bench.PatchSet() as patches:
+        bench.install_compile_probe(patches, recorder)
+        assert "torch._dynamo.exc" not in sys.modules
+        monkeypatch.setitem(sys.modules, "torch._dynamo.exc", fake_compiler.exceptions)
+        with pytest.raises(fake_compiler.restart) as raised:
+            fake_compiler.wrapper()()
+    assert raised.value is exception
+    assert recorder.totals()["compile_restarts"] == 1
+    assert recorder.totals()["compile_errors"] == 0
+
+
+@pytest.mark.parametrize("exception", [KeyboardInterrupt(), SystemExit(17)])
+def test_compile_probe_does_not_swallow_interruptions(fake_compiler, exception):
+    fake_compiler.outcomes = [exception]
+    recorder = bench.Recorder()
+    with bench.PatchSet() as patches:
+        bench.install_compile_probe(patches, recorder)
+        with pytest.raises(type(exception)) as raised:
+            fake_compiler.wrapper()()
+    assert raised.value is exception
+    totals = recorder.totals()
+    assert totals["compile_attempts"] == 1
+    assert totals["graphs_compiled"] == totals["compile_restarts"] == totals["compile_errors"] == 0
+    assert not bench._valid_compile_counts(totals)
+
+
 def test_compile_probe_counts_real_inductor():
     reason = _inductor_skip_reason()
     if reason is not None:
@@ -3366,6 +3779,8 @@ def test_compile_probe_counts_real_inductor():
     totals = recorder.totals()
     assert totals["graphs_compiled"] >= 1
     assert totals["compile_errors"] == 0
+    assert bench._valid_compile_counts(totals)
+    assert captured["compile_after"]["compile_attempts"] == totals["compile_attempts"]
     assert captured["unattributed"]["graph_execs"] == 3
     assert captured["graphs_compiled_after"] - captured["graphs_compiled_before"] == totals["graphs_compiled"]
 
@@ -3399,7 +3814,7 @@ class _FakeOmni:
         self.omni_kwargs = omni_kwargs
         self.closed = False
         self.num_stages = service.num_stages
-        od_config = SimpleNamespace(enforce_eager=False, step_execution=False, num_gpus=1)
+        od_config = OmniDiffusionConfig(enforce_eager=False, step_execution=False, num_gpus=1)
         self.engine = SimpleNamespace(stage_clients=[SimpleNamespace(stage_type="diffusion", od_config=od_config)])
         for compiled_blocks, error in service.setup_calls:
             names = ["FakeBlock"] if compiled_blocks else []
@@ -3492,9 +3907,9 @@ class _FakeService:
         self.omnis.append(omni)
         return omni
 
-    def _build_sampling_params(self, sampling_params: dict[str, Any], schedule: Any) -> SimpleNamespace:
+    def _build_sampling_params(self, sampling_params: dict[str, Any], schedule: Any) -> OmniDiffusionSamplingParams:
         self.schedules.append(schedule)
-        return SimpleNamespace(attention_schedule=schedule, **sampling_params)
+        return OmniDiffusionSamplingParams(attention_schedule=schedule, **sampling_params)
 
     def _collect_source(self) -> dict[str, Any]:
         return {
@@ -3526,11 +3941,11 @@ class _FakeService:
             raise RuntimeError("generation failed")
         value = torch.zeros(1, 4)
         if self.emit_steps:
-            value = self._denoise(params.attention_schedule or [])
+            value = self._denoise([dataclasses.asdict(entry) for entry in params.attention_schedule or ()])
         frames = self.frames_by_call.get(index, _FRAMES)
         # Numpy frames with a batch axis: [1, frames, height, width, channels], values in [0, 1].
         video = np.full((1, frames, 4, 4, 3), float(value.mean()) / 100.0, dtype=np.float32)
-        return [SimpleNamespace(images=[video], error=None)]
+        return [OmniRequestOutput(images=[video])]
 
     def _denoise(self, schedule: list[dict[str, Any]]) -> torch.Tensor:
         recorder, config = self.recorder, self.config
@@ -3546,6 +3961,7 @@ class _FakeService:
         for step, profile in enumerate(bench.expected_profiles(schedule, total)):
             recorder.begin_step(step, transformer=self.transformers[step] if self.transformers else None)
             if recorder.totals()["graphs_compiled"] == 0:
+                recorder.note_compile_attempt()
                 recorder.note_graph_compiled()
             recorder.block_enter(0)
             recorder.note_graph_executed(0)
@@ -3711,6 +4127,37 @@ def test_run_session_stops_when_the_service_has_several_stages(fake_service, ses
     assert record["requests"] == []
     assert fake_service.generate_calls == 0
     assert fake_service.omnis[0].closed
+
+
+def test_run_session_retains_retry_exhaustion_after_tensorify_restarts(fake_service, fake_compiler, monkeypatch):
+    terminal = RuntimeError("restart limit reached")
+    fake_compiler.outcomes = [fake_compiler.restart("retry") for _ in range(3)]
+
+    def exhausted_generate(prompt, params):
+        recorder = fake_service.recorder
+        with bench.PatchSet() as patches:
+            bench.install_compile_probe(patches, recorder)
+            compiler = fake_compiler.wrapper()
+            for _ in range(3):
+                with pytest.raises(fake_compiler.restart):
+                    compiler()
+        # Dynamo raises the terminal failure outside the observed backend call.
+        raise terminal
+
+    monkeypatch.setattr(fake_service, "generate", exhausted_generate)
+    assert fake_service.run("scheduled") == 4
+    record = fake_service.record("scheduled")
+    assert record["status"] == "aborted"
+    assert record["abort"] == {"stage": "request", "error_type": "RuntimeError", "message": str(terminal)}
+    assert record["requests"][0]["error"]["message"] == str(terminal)
+    assert record["requests"][0]["compile_after"] == _compile_counts(0, restarts=3)
+    assert record["probes"]["compile"]["compile_restarts"] == 3
+    assert record["probes"]["compile"]["compile_errors"] == 0
+    assert fake_service.omnis[0].closed
+    result = bench.evaluate_combination(
+        {"scheduled": record, "plain": None, "prechange": None}, directory=fake_service.out_dir
+    )
+    assert result["status"] == "not_success"
 
 
 def test_run_session_stops_when_the_warmup_reaches_no_step(fake_service):

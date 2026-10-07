@@ -11,12 +11,13 @@ import torch.nn as nn
 import vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer as hy3_transformer_module
 import vllm_omni.diffusion.models.hunyuan_image3.pipeline_hunyuan_image3 as hy3_module
 import vllm_omni.diffusion.models.hunyuan_image3.request_layout as hy3_layout_module
+from tests.diffusion.attention.test_attention_schedule_candidates import _make_metadata_candidate
 from vllm_omni.diffusion.attention.schedule import (
     AttentionScheduleRange,
     InvalidAttentionScheduleError,
     require_denoise_progress_publisher,
 )
-from vllm_omni.diffusion.data import AttentionConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
 from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_tokenizer import TokenizerEncodeOutput
 from vllm_omni.diffusion.models.hunyuan_image3.hunyuan_image3_transformer import (
@@ -729,7 +730,7 @@ def _prepare_encode_pipeline(monkeypatch, *, num_timesteps: int, events: list):
         raise RuntimeError("stop at prepare_latents")
 
     monkeypatch.setattr(hy3_module, "retrieve_timesteps", fake_retrieve_timesteps)
-    pipeline.config = SimpleNamespace(vae={"latent_channels": 1})
+    pipeline.config = hy3_transformer_module.HunyuanImage3Config(vae={"latent_channels": 1})
     pipeline.scheduler = SimpleNamespace()
     pipeline._pipeline = SimpleNamespace(prepare_latents=fake_prepare_latents)
     pipeline.prepare_model_inputs = lambda **_kwargs: {
@@ -741,9 +742,9 @@ def _prepare_encode_pipeline(monkeypatch, *, num_timesteps: int, events: list):
 
 
 def _schedule_state(pipeline, *, ranges, source: str, num_inference_steps: int) -> StepRequestState:
-    pipeline.od_config.diffusion_attention_schedule = SimpleNamespace(
-        profiles={"sparse": AttentionSpec(backend="TORCH_SDPA")},
-        default=ranges if source == "service-default" else None,
+    pipeline.od_config.diffusion_attention_schedule = AttentionScheduleConfig(
+        profiles={"sparse": AttentionConfig(default=AttentionSpec(backend="TORCH_SDPA"))},
+        default=ranges if source == "service-default" else [],
     )
     sampling = _sampling_params()
     sampling.num_inference_steps = num_inference_steps
@@ -823,7 +824,9 @@ def _request_mode_pipeline(monkeypatch, *, num_steps: int, events: list, fail_at
 
     # The request-mode pipeline publishes through its model, which is the HunyuanImage3Pipeline itself.
     model = _pipeline()
-    model.config = SimpleNamespace(cfg_distilled=False, use_meanflow=False, vae={"latent_channels": 1})
+    model.config = hy3_transformer_module.HunyuanImage3Config(
+        cfg_distilled=False, use_meanflow=False, vae={"latent_channels": 1}
+    )
     model.generation_config = None
     mask = torch.ones(1, 1, 2, 2, dtype=torch.bool)
     model._prepare_attention_mask_for_generation = lambda input_ids, generation_config, model_kwargs: mask
@@ -918,14 +921,16 @@ def test_request_loop_restores_progress_after_forward_failure(monkeypatch):
 class _SpecDependentMaskBackend:
     @classmethod
     def supports_attention_mask(cls, attention_spec=None) -> bool:
-        return attention_spec == "mask-variant"
+        return attention_spec.backend == "TORCH_SDPA"
 
 
 def test_image_attention_mask_check_rejects_candidates_without_mask_support():
     check = hy3_transformer_module._require_attention_mask_support
 
-    assert check(SimpleNamespace(backend_cls=_SpecDependentMaskBackend, spec="mask-variant")) is None
-    reason = check(SimpleNamespace(backend_cls=_SpecDependentMaskBackend, spec="plain-variant"))
+    masked = _make_metadata_candidate(_SpecDependentMaskBackend, AttentionSpec(backend="TORCH_SDPA"))
+    plain = _make_metadata_candidate(_SpecDependentMaskBackend, AttentionSpec(backend="TRTLLM_ATTN"))
+    assert check(masked) is None
+    reason = check(plain)
     assert reason is not None and "4D attention mask" in reason
 
 
@@ -953,11 +958,12 @@ def test_hunyuan_model_registers_mask_check_on_image_attention_only(monkeypatch)
     monkeypatch.setattr(hy3_transformer_module, "VocabParallelEmbedding", lambda *args, **kwargs: nn.Identity())
     monkeypatch.setattr(hy3_transformer_module, "RMSNorm", lambda *args, **kwargs: nn.Identity())
     monkeypatch.setattr(hy3_transformer_module, "make_layers", lambda *args, **kwargs: (0, 1, nn.ModuleList([layer])))
-    config = SimpleNamespace(
+    config = hy3_transformer_module.HunyuanImage3Config(
         pad_token_id=0,
         vocab_size=8,
         hidden_size=4,
         num_hidden_layers=1,
+        num_attention_heads=1,
         tie_word_embeddings=False,
         rms_norm_eps=1e-6,
     )

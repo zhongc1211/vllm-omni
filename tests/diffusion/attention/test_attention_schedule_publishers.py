@@ -33,7 +33,7 @@ from vllm_omni.diffusion.attention.schedule import (
     require_request_attention_schedule_fits,
 )
 from vllm_omni.diffusion.config import set_current_diffusion_config
-from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
+from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec, OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import (
     DenoiseProgressMixin,
     begin_scheduled_denoise,
@@ -46,6 +46,8 @@ from vllm_omni.diffusion.forward_context import (
     set_forward_context_denoise_timestep,
     set_forward_context_denoise_total_steps,
 )
+from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.diffusion.worker.utils import StepRequestState
 from vllm_omni.errors import OmniClientError, client_error_metadata
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
@@ -103,17 +105,8 @@ def _fake_resolve(*, role, head_size, attention_config=None, role_category=None,
     return _fake_backend(spec.backend.upper()), spec
 
 
-def _make_config(*, schedule=None):
-    """The od_config fields that Attention construction and startup validation read."""
-    return SimpleNamespace(
-        diffusion_attention_config=AttentionConfig(),
-        diffusion_attention_schedule=schedule,
-        diffusion_kv_mode=layer_mod.DiffusionKVCacheMode.DENSE_LEGACY,
-        parallel_config=SimpleNamespace(ring_degree=1, allgather_degree=1, sequence_parallel_size=1, ulysses_degree=1),
-        diffusion_kv_cache_dtype=None,
-        diffusion_kv_cache_skip_step_indices=None,
-        diffusion_kv_cache_skip_layer_indices=None,
-    )
+def _make_config(*, schedule: AttentionScheduleConfig | None = None) -> OmniDiffusionConfig:
+    return OmniDiffusionConfig(diffusion_attention_schedule=schedule)
 
 
 @pytest.fixture
@@ -382,9 +375,11 @@ def test_require_attention_schedule_fits_rejects_as_client_error(schedule, total
     assert client_error_metadata(excinfo.value) == (400, "invalid_attention_schedule")
 
 
-def _carrier(holder, params):
+def _carrier(holder: str, params: OmniDiffusionSamplingParams) -> OmniDiffusionRequest | StepRequestState:
     """A request exposes sampling_params; a runner step state exposes sampling."""
-    return SimpleNamespace(sampling_params=params) if holder == "request" else SimpleNamespace(sampling=params)
+    if holder == "request":
+        return OmniDiffusionRequest(prompt="scheduled request", request_id="carrier", sampling_params=params)
+    return StepRequestState(request_id="carrier", sampling=params)
 
 
 @pytest.mark.parametrize("holder", ["request", "state"])
@@ -400,7 +395,7 @@ def test_require_request_attention_schedule_fits_checks_the_resolved_request_sch
     holder, request_schedule, expected
 ):
     carrier = _carrier(holder, OmniDiffusionSamplingParams(attention_schedule=request_schedule))
-    od_config = SimpleNamespace(diffusion_attention_schedule=_service())
+    od_config = OmniDiffusionConfig(diffusion_attention_schedule=_service())
 
     assert require_request_attention_schedule_fits(carrier, od_config, 3) == expected
     with pytest.raises(InvalidAttentionScheduleError, match="exceeds total_steps=1"):
@@ -416,7 +411,7 @@ def test_require_request_attention_schedule_fits_checks_the_resolved_request_sch
 def test_require_request_attention_schedule_fits_skips_an_unscheduled_request(holder, request_schedule, service):
     # The service default [0, 2) does not fit a 1-step sequence; an unscheduled request is not checked.
     carrier = _carrier(holder, OmniDiffusionSamplingParams(attention_schedule=request_schedule))
-    od_config = SimpleNamespace(diffusion_attention_schedule=service)
+    od_config = OmniDiffusionConfig(diffusion_attention_schedule=service)
 
     assert require_request_attention_schedule_fits(carrier, od_config, 1) == ()
 

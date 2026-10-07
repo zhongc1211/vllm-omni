@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, AttentionSpec
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import CachedRequestData, DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.diffusion_model_runner import DiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.capability import (
@@ -22,6 +23,7 @@ from vllm_omni.experimental.ar_diffusion.capability import (
 from vllm_omni.experimental.ar_diffusion.kv_cache import ARDiffusionKVConfig
 from vllm_omni.experimental.ar_diffusion.runner import ARDiffusionModelRunner
 from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionTickRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 BLOCK = 16
 POS = "positive"
@@ -523,9 +525,10 @@ def test_attention_schedule_rejection_keeps_existing_session_kv(monkeypatch, pip
         raise AssertionError("a rejected request must not reach the base runner")
 
     monkeypatch.setattr(DiffusionModelRunner, "execute_model", base_forward)
-    request = SimpleNamespace(
+    request = OmniDiffusionRequest(
+        prompt="scheduled request",
         request_id="scheduled-request",
-        sampling_params=SimpleNamespace(
+        sampling_params=OmniDiffusionSamplingParams(
             extra_args={"session_id": "s1"},
             attention_schedule=[{"start": 0, "end": 1, "profile": "dense"}],
         ),

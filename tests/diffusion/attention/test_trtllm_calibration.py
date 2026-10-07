@@ -3,6 +3,8 @@
 
 import pytest
 
+from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
+from vllm_omni.diffusion.attention.backends.trtllm_attn import TrtllmAttentionBackend
 from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
     is_ignored,
     layer_match_names,
@@ -10,6 +12,8 @@ from vllm_omni.diffusion.attention.backends.trtllm_calibration import (
     resolve_layer_calibration,
     select_expert,
 )
+from vllm_omni.diffusion.attention.layer import _PreparedCandidate
+from vllm_omni.diffusion.data import AttentionSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -147,12 +151,23 @@ def test_parse_empty_returns_none():
     assert parse_sparse_attention_config({}) is None
 
 
-class _FakeImpl:
-    def __init__(self):
-        self.stamped = None
+class _FakeImpl(AttentionImpl[AttentionMetadata]):
+    def __init__(self) -> None:
+        self.stamped: tuple[float, float] | None = None
 
-    def set_layer_calibration(self, a, b):
+    def set_layer_calibration(self, a: float, b: float) -> None:
         self.stamped = (a, b)
+
+
+def _candidate(impl: _FakeImpl, spec: AttentionSpec | None = None) -> _PreparedCandidate:
+    return _PreparedCandidate(
+        backend_cls=TrtllmAttentionBackend,
+        spec=spec,
+        impl_cls=_FakeImpl,
+        impl=impl,
+        backend_explicit=True,
+        backend_pref="TRTLLM_ATTN",
+    )
 
 
 def _fake_pipeline():
@@ -226,8 +241,6 @@ def test_apply_to_pipeline_routes_and_ignores():
 
 def test_apply_to_pipeline_stamps_all_schedule_candidates():
     """Every prepared candidate impl without its own curve gets the baseline's per-layer calibration."""
-    from types import SimpleNamespace
-
     import torch.nn as nn
 
     from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
@@ -235,7 +248,7 @@ def test_apply_to_pipeline_stamps_all_schedule_candidates():
     attn = nn.Module()
     attn.attention = _FakeImpl()
     c1, c2 = _FakeImpl(), _FakeImpl()
-    attn._schedule_candidates = {"p1": SimpleNamespace(impl=c1), "p2": SimpleNamespace(impl=c2)}
+    attn._schedule_candidates = {"p1": _candidate(impl=c1), "p2": _candidate(impl=c2)}
     pipe = nn.Module()
     pipe.attn = attn
 
@@ -254,8 +267,6 @@ def test_apply_to_pipeline_stamps_trtllm_candidate_under_dense_baseline():
     set_layer_calibration, so a dense baseline without that method does not leave a TRTLLM
     candidate on the same layer uncalibrated.
     """
-    from types import SimpleNamespace
-
     import torch.nn as nn
 
     from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
@@ -263,7 +274,7 @@ def test_apply_to_pipeline_stamps_trtllm_candidate_under_dense_baseline():
     attn = nn.Module()
     attn.attention = object()  # dense baseline impl without set_layer_calibration
     cand = _FakeImpl()
-    attn._schedule_candidates = {"sparse": SimpleNamespace(impl=cand)}
+    attn._schedule_candidates = {"sparse": _candidate(impl=cand)}
     pipe = nn.Module()
     pipe.attn = attn
 
@@ -275,8 +286,6 @@ def test_apply_to_pipeline_stamps_trtllm_candidate_under_dense_baseline():
 
 def test_apply_to_pipeline_ignored_layer_skips_baseline_and_candidates():
     """An ignored layer calibrates neither baseline nor candidates (legitimate dense fallback)."""
-    from types import SimpleNamespace
-
     import torch.nn as nn
 
     from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
@@ -284,7 +293,7 @@ def test_apply_to_pipeline_ignored_layer_skips_baseline_and_candidates():
     attn = nn.Module()
     attn.attention = _FakeImpl()
     cand = _FakeImpl()
-    attn._schedule_candidates = {"p": SimpleNamespace(impl=cand)}
+    attn._schedule_candidates = {"p": _candidate(impl=cand)}
     pipe = nn.Module()
     pipe.transformer = attn
 
@@ -331,8 +340,6 @@ def test_collect_calibration_specs_covers_baseline_and_every_profile():
 
 
 def test_apply_skip_softmax_calibration_discovers_profile_only_calibration():
-    from types import SimpleNamespace
-
     import torch.nn as nn
 
     from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_skip_softmax_calibration
@@ -358,7 +365,7 @@ def test_apply_skip_softmax_calibration_discovers_profile_only_calibration():
     attn = nn.Module()
     attn.attention = object()  # dense baseline impl without set_layer_calibration
     cand = _FakeImpl()
-    attn._schedule_candidates = {"sparse": SimpleNamespace(impl=cand)}
+    attn._schedule_candidates = {"sparse": _candidate(impl=cand)}
     pipe = nn.Module()
     pipe.attn = attn
 
@@ -373,8 +380,6 @@ def test_apply_skip_softmax_calibration_discovers_profile_only_calibration():
 def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
     # A candidate with its own skip_calibration must not receive the fallback dict. The baseline
     # and a candidate without its own dict still receive that fallback.
-    from types import SimpleNamespace
-
     import torch.nn as nn
 
     from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
@@ -385,14 +390,14 @@ def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
     own = _FakeImpl()
     fallback_only = _FakeImpl()
     attn._schedule_candidates = {
-        "own": SimpleNamespace(
+        "own": _candidate(
             impl=own,
             spec=AttentionSpec(
                 backend="TRTLLM_ATTN",
                 skip_calibration={"by_expert": {"attn": {"a": 9.0, "b": 8.0}}},
             ),
         ),
-        "fallback": SimpleNamespace(impl=fallback_only, spec=None),
+        "fallback": _candidate(impl=fallback_only, spec=None),
     }
     pipe = nn.Module()
     pipe.attn = attn
@@ -407,8 +412,6 @@ def test_apply_to_pipeline_stamps_each_candidate_from_its_own_curve():
 
 def test_apply_to_pipeline_counts_a_shared_impl_once():
     # Two profile names that share one impl are one stamp, not two.
-    from types import SimpleNamespace
-
     import torch.nn as nn
 
     from vllm_omni.diffusion.attention.backends.trtllm_calibration import apply_to_pipeline
@@ -416,7 +419,7 @@ def test_apply_to_pipeline_counts_a_shared_impl_once():
     attn = nn.Module()
     attn.attention = _FakeImpl()
     shared = _FakeImpl()
-    record = SimpleNamespace(impl=shared, spec=None)
+    record = _candidate(impl=shared, spec=None)
     attn._schedule_candidates = {"a": record, "b": record}
     pipe = nn.Module()
     pipe.attn = attn

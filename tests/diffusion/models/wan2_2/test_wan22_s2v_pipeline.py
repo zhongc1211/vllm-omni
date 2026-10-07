@@ -13,6 +13,7 @@ import torch.nn as nn
 
 from tests.diffusion.models.wan2_2.conftest import noop_progress_bar
 from vllm_omni.diffusion.attention.schedule import AttentionScheduleRange, InvalidAttentionScheduleError
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.forward_context import bind_attention_schedule, get_forward_context, set_forward_context
 from vllm_omni.diffusion.models.schedulers import FlowUniPCMultistepScheduler
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
@@ -20,7 +21,9 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2_s2v import (
     _make_clip_generators,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import WanS2VTransformer3DModel
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.diffusion]
 
@@ -63,7 +66,7 @@ def _make_s2v_sampling(**overrides):
         "extra_args": {},
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return OmniDiffusionSamplingParams(**values)
 
 
 def _make_s2v_validation_pipeline() -> Wan22S2VPipeline:
@@ -947,7 +950,7 @@ def _run_two_clip_s2v_forward(monkeypatch, schedule, events: list[tuple[object, 
         dtype=torch.float32,
         decode=lambda latents, return_dict=False: (torch.zeros(1, 3, 8, 16, 16),),
     )
-    pipeline.od_config = SimpleNamespace(enable_cpu_offload=False, parallel_config=SimpleNamespace(use_hsdp=False))
+    pipeline.od_config = OmniDiffusionConfig(enable_cpu_offload=False)
     pipeline.scheduler = _ThreeStepS2VScheduler()
     pipeline._flow_shift = 3.0
     pipeline.vae_scale_factor_spatial = 8
@@ -974,7 +977,7 @@ def _run_two_clip_s2v_forward(monkeypatch, schedule, events: list[tuple[object, 
     pipeline.predict_noise_maybe_with_cfg = fake_predict_noise_maybe_with_cfg
     batch = DiffusionRequestBatch(
         requests=[
-            SimpleNamespace(
+            OmniDiffusionRequest(
                 request_id="a",
                 prompt={
                     "prompt": "speak",

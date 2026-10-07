@@ -27,7 +27,6 @@ do not exercise the full model-registry pipeline.
 import os
 import pickle
 import tempfile
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -859,12 +858,7 @@ def _patch_sp_env(monkeypatch, *, od_config, world_size=2, rank=0):
     monkeypatch.setattr(parallel_state, "get_sequence_parallel_world_size", lambda: world_size)
     monkeypatch.setattr(parallel_state, "get_sequence_parallel_rank", lambda: rank)
     monkeypatch.setattr(parallel_state, "get_ring_parallel_world_size", lambda: 1)
-    ctx = SimpleNamespace(
-        omni_diffusion_config=od_config,
-        sp_shard_metadata={},
-        sp_padding_size=None,
-        sp_original_seq_len=None,
-    )
+    ctx = forward_context.ForwardContext(omni_diffusion_config=od_config)
     monkeypatch.setattr(forward_context, "is_forward_context_available", lambda: True)
     monkeypatch.setattr(forward_context, "get_forward_context", lambda: ctx)
     return ctx
@@ -873,9 +867,9 @@ def _patch_sp_env(monkeypatch, *, od_config, world_size=2, rank=0):
 def test_auto_pad_probe_rejects_schedule_profile_without_mask_support(monkeypatch):
     import vllm_omni.diffusion.attention.selector as selector
 
-    od_config = SimpleNamespace(
+    od_config = OmniDiffusionConfig(
         diffusion_attention_config=AttentionConfig(),
-        diffusion_attention_schedule=SimpleNamespace(profiles={"sparse": AttentionConfig()}),
+        diffusion_attention_schedule=AttentionScheduleConfig(profiles={"sparse": AttentionConfig()}),
     )
     _patch_sp_env(monkeypatch, od_config=od_config)
     monkeypatch.setattr(
@@ -894,9 +888,9 @@ def test_auto_pad_probe_rejects_schedule_profile_without_mask_support(monkeypatc
 def test_auto_pad_probe_pads_when_every_profile_supports_mask(monkeypatch):
     import vllm_omni.diffusion.attention.selector as selector
 
-    od_config = SimpleNamespace(
+    od_config = OmniDiffusionConfig(
         diffusion_attention_config=AttentionConfig(),
-        diffusion_attention_schedule=SimpleNamespace(profiles={"sparse": AttentionConfig()}),
+        diffusion_attention_schedule=AttentionScheduleConfig(profiles={"sparse": AttentionConfig()}),
     )
     ctx = _patch_sp_env(monkeypatch, od_config=od_config)
     monkeypatch.setattr(
@@ -919,7 +913,7 @@ def test_auto_pad_probe_keeps_baseline_message_without_schedule(monkeypatch):
     # Characterization: with no schedule the baseline-only wording must not change.
     import vllm_omni.diffusion.attention.selector as selector
 
-    od_config = SimpleNamespace(diffusion_attention_config=AttentionConfig(), diffusion_attention_schedule=None)
+    od_config = OmniDiffusionConfig(diffusion_attention_config=AttentionConfig(), diffusion_attention_schedule=None)
     _patch_sp_env(monkeypatch, od_config=od_config)
     monkeypatch.setattr(
         selector,
@@ -938,7 +932,7 @@ def test_auto_pad_probe_enumerates_real_schedule_profiles(monkeypatch):
         profiles={"mask_free": AttentionConfig(default=AttentionSpec(backend="TRTLLM_ATTN"))},
         default=[{"start": 0, "end": None, "profile": "mask_free"}],
     )
-    od_config = SimpleNamespace(
+    od_config = OmniDiffusionConfig(
         diffusion_attention_config=AttentionConfig(default=AttentionSpec(backend="CUDNN_ATTN")),
         diffusion_attention_schedule=schedule,
     )

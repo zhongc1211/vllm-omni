@@ -20,7 +20,12 @@ from vllm.config.load import LoadConfig
 
 import vllm_omni.diffusion.model_loader.diffusers_loader as loader_module
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
-from vllm_omni.diffusion.data import DiffusionParallelConfig, OmniDiffusionConfig
+from vllm_omni.diffusion.data import (
+    AttentionConfig,
+    AttentionScheduleConfig,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
+)
 from vllm_omni.diffusion.lora.manager import LoRABackend
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
@@ -2299,9 +2304,9 @@ def test_hsdp_checkpoint_plan_honors_remap_and_rejects_missing(tmp_path, checkpo
 
 
 def _schedule_loader(schedule) -> DiffusersPipelineLoader:
-    od_config = SimpleNamespace(
+    od_config = OmniDiffusionConfig(
         dtype=torch.float32,
-        parallel_config=SimpleNamespace(use_hsdp=False),
+        parallel_config=DiffusionParallelConfig(use_hsdp=False),
         quantization_config=None,
         diffusion_attention_config=None,
         diffusion_attention_schedule=schedule,
@@ -2313,7 +2318,7 @@ def test_loader_passes_schedule_to_calibration_and_validates_candidates(monkeypa
     import vllm_omni.diffusion.attention.backends.trtllm_calibration as calib_mod
     import vllm_omni.diffusion.attention.layer as layer_mod
 
-    schedule = SimpleNamespace(profiles={"p": SimpleNamespace()})
+    schedule = AttentionScheduleConfig(profiles={"p": AttentionConfig()})
     loader = _schedule_loader(schedule)
     model = nn.Module()
     calls = {}
@@ -2331,7 +2336,7 @@ def test_loader_passes_schedule_to_calibration_and_validates_candidates(monkeypa
     loader._apply_skip_softmax_calibration(model)
     validated = loader._validate_attention_schedule_candidates(model)
 
-    assert calls["calibration"][1] is schedule
+    assert calls["calibration"][1] is loader.od_config.diffusion_attention_schedule is not None
     assert validated == 7
     assert calls["validate"][0] is model
     assert calls["validate"][1] is loader.od_config
@@ -2368,14 +2373,14 @@ def test_load_model_runs_both_schedule_hooks_on_every_load_branch(monkeypatch, b
     import vllm_omni.diffusion.attention.backends.trtllm_calibration as calib_mod
     import vllm_omni.diffusion.attention.layer as layer_mod
 
-    schedule = SimpleNamespace(profiles={"p": SimpleNamespace()})
-    od_config = SimpleNamespace(
+    schedule = AttentionScheduleConfig(profiles={"p": AttentionConfig()})
+    od_config = OmniDiffusionConfig(
         dtype=torch.float32,
         hsdp_weight_load_strategy="pre_sharded" if branch == "hsdp-pre-sharded" else "full",
         quantization_config=None,
         diffusion_attention_config=None,
         diffusion_attention_schedule=schedule,
-        parallel_config=SimpleNamespace(use_hsdp=branch != "plain", hsdp_replicate_size=1, hsdp_shard_size=2),
+        parallel_config=DiffusionParallelConfig(use_hsdp=branch != "plain", hsdp_replicate_size=1, hsdp_shard_size=2),
     )
     loader = DiffusersPipelineLoader(LoadConfig(), od_config)
     model = nn.Module()
@@ -2413,5 +2418,5 @@ def test_load_model_runs_both_schedule_hooks_on_every_load_branch(monkeypatch, b
     assert loaders == expected_loaders
     assert [name for name, _pipeline, _arg in hooks] == ["calibration", "validate"]
     assert all(pipeline is model for _name, pipeline, _arg in hooks)
-    assert hooks[0][2] is schedule
+    assert hooks[0][2] is od_config.diffusion_attention_schedule is not None
     assert hooks[1][2] is od_config

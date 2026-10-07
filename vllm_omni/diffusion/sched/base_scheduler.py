@@ -749,11 +749,12 @@ class BaseScheduler(ABC):
         from vllm_omni.diffusion.attention.schedule import parse_attention_schedule
 
         key_kwargs = {name: getattr(sampling, name) for name in _STEP_BATCH_SAMPLING_PARAMS_KEY_FIELD_NAMES}
-        key_kwargs["attention_schedule"] = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
+        attention_schedule = parse_attention_schedule(getattr(sampling, "attention_schedule", None))
         return StepBatchSamplingParamsKey(
             condition_key=getattr(request, "batch_compatibility_key", None),
             lora_int_id=lora_request.lora_int_id if lora_request is not None else None,
             use_step_execution=getattr(request, "use_step_execution", True),
+            attention_schedule=attention_schedule,
             **key_kwargs,
         )
 

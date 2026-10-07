@@ -20,14 +20,17 @@ from types import SimpleNamespace
 import pytest
 
 import vllm_omni.diffusion.attention.layer as layer_mod
+from vllm_omni.diffusion.attention.backends.abstract import AttentionImpl, AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionBackend
-from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.layer import Attention, _PreparedCandidate
 from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 from vllm_omni.diffusion.config import set_current_diffusion_config
 from vllm_omni.diffusion.data import (
     AttentionConfig,
     AttentionScheduleConfig,
     AttentionSpec,
+    DiffusionParallelConfig,
+    OmniDiffusionConfig,
     SkipSoftmaxSpec,
 )
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
@@ -56,6 +59,23 @@ class _FakeImpl:
 
     def set_layer_calibration(self, a, b):
         self.calibration = (a, b)
+
+
+class _MetadataOnlyImpl(_FakeImpl, AttentionImpl[AttentionMetadata]):
+    def forward(self, *args, **kwargs):
+        raise AssertionError("metadata-only fixture must not execute attention")
+
+
+def _make_metadata_candidate(backend_cls: type, spec: AttentionSpec | None = None) -> _PreparedCandidate:
+    impl = _MetadataOnlyImpl()
+    return _PreparedCandidate(
+        backend_cls=backend_cls,
+        spec=spec,
+        impl_cls=_MetadataOnlyImpl,
+        impl=impl,
+        backend_explicit=spec is not None,
+        backend_pref=spec.backend if spec is not None else None,
+    )
 
 
 _BACKEND_CACHE: dict[str, type] = {}
@@ -113,21 +133,26 @@ def _fake_resolve(*, role, head_size, attention_config=None, role_category=None,
 
 
 def _make_config(
-    *, baseline=None, schedule=None, kv_mode=None, allgather_degree=1, kv_dtype=None, sp_size=1, ring_degree=1
-):
-    return SimpleNamespace(
+    *,
+    baseline: AttentionConfig | None = None,
+    schedule: AttentionScheduleConfig | None = None,
+    kv_mode: layer_mod.DiffusionKVCacheMode | None = None,
+    allgather_degree: int = 1,
+    kv_dtype: str | None = None,
+    sp_size: int = 1,
+    ring_degree: int = 1,
+) -> OmniDiffusionConfig:
+    return OmniDiffusionConfig(
         diffusion_attention_config=baseline if baseline is not None else AttentionConfig(),
         diffusion_attention_schedule=schedule,
         diffusion_kv_mode=kv_mode if kv_mode is not None else layer_mod.DiffusionKVCacheMode.DENSE_LEGACY,
-        parallel_config=SimpleNamespace(
+        parallel_config=DiffusionParallelConfig(
             ring_degree=ring_degree,
             allgather_degree=allgather_degree,
-            sequence_parallel_size=sp_size,
             ulysses_degree=sp_size,
         ),
         diffusion_kv_cache_dtype=kv_dtype,
-        diffusion_kv_cache_skip_step_indices=None,
-        diffusion_kv_cache_skip_layer_indices=None,
+        diffusion_kv_max_rows_per_request=64 if kv_mode is layer_mod.DiffusionKVCacheMode.PAGED_SCHEDULER else None,
     )
 
 

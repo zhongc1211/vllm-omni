@@ -1132,8 +1132,12 @@ def test_distilled_forward_rejects_a_mismatched_explicit_step_count():
 
 def _scheduled_od_config(default=None, **fields):
     """Service config with one prepared profile, an optional default schedule and any further config fields."""
-    return SimpleNamespace(
-        diffusion_attention_schedule=SimpleNamespace(profiles={"sparse": object()}, default=default),
+    from vllm_omni.diffusion.data import AttentionConfig, AttentionScheduleConfig, OmniDiffusionConfig
+
+    return OmniDiffusionConfig(
+        diffusion_attention_schedule=AttentionScheduleConfig(
+            profiles={"sparse": AttentionConfig()}, default=[] if default is None else default
+        ),
         **fields,
     )
 
@@ -1191,11 +1195,15 @@ def test_forward_rejects_an_attention_schedule_with_request_scoped_cache_dit():
 
     diffuse_calls: list[dict[str, Any]] = []
     prepared: list[object] = []
-    cache_spec = object()
+    from vllm_omni.diffusion.cache.cachedit import CacheDiTRequestSpec
+    from vllm_omni.diffusion.data import DiffusionCacheConfig
+    from vllm_omni.diffusion.models.minimax_h3.quality_policy import MiniMaxH3QualityPlan
+
+    cache_spec = CacheDiTRequestSpec("test-high", DiffusionCacheConfig(), num_inference_steps=4)
     pipeline = _distilled_pipeline(diffuse_calls, {"fl2va": None, "ref2va": None})
     pipeline.od_config = _scheduled_od_config()
     # The plan MiniMaxH3QualityPolicy returns for quality=high.
-    pipeline._quality_policy = SimpleNamespace(resolve=lambda **kwargs: SimpleNamespace(cache_dit=cache_spec))
+    pipeline._quality_policy = SimpleNamespace(resolve=lambda **kwargs: MiniMaxH3QualityPlan(cache_dit=cache_spec))
     pipeline._cache_dit_runtime = SimpleNamespace(prepare=prepared.append)
     schedule = [{"start": 0, "end": 2, "profile": "sparse"}]
 

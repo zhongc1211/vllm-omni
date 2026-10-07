@@ -20,8 +20,9 @@ This guide uses two more terms:
   platform default. Steps that no range covers use the base configuration; see
   the [attention backend overview](../attention_backends.md#configuration).
 
-The feature has been tested with toy models and stand-in attention kernels on
-CPU. No request with a schedule has been run on a served model; see
+Automated coverage uses toy models and stand-in attention kernels on CPU.
+Wan2.2 T2V schedules have also been exercised in process on an NVIDIA B300.
+Model validation remains incomplete; see
 [Verification status](#verification-status).
 
 ## Pipelines that accept a schedule
@@ -35,8 +36,9 @@ and step count) to the attention layers. The following pipelines do:
 | Wan2.2 (T2V, I2V, S2V, VACE) | Accepted | The model has no step mode |
 | HunyuanImage-3.0 | Accepted | Accepted |
 
-The table is derived from the code and from CPU tests. None of these
-combinations has been run with a schedule on real weights.
+The table describes support established by the code and CPU tests. Of these
+pipelines, only Wan2.2 T2V has been exercised with a schedule on real weights.
+The other model and execution-mode combinations still need model validation.
 
 With any other pipeline, a server that configures profiles fails at startup.
 [Diffusion Execution Modes](../execution_modes.md) describes the two modes.
@@ -346,16 +348,9 @@ The response depends on where the error is detected. On the HTTP endpoints:
 - A malformed schedule or an undeclared profile returns HTTP 400 with the
   message in the JSON error body.
 - A range that does not fit is detected when the pipeline builds its timestep
-  sequence. In step mode the response is HTTP 400. In request mode the
-  response is currently an HTTP 5xx whose text contains the message, with one
-  exception: on the in-process executor, a request that shares its batch with
-  another request receives HTTP 400. The in-process executor is the default
-  for a diffusion stage with one GPU. A stage with more than one GPU, or with
-  `distributed_executor_backend: mp`, uses the multi-process executor, which
-  returns the 5xx for any batch size. Bundled deploy files such as
-  `wan2_2_ti2v.yaml` set `distributed_executor_backend: mp`. MiniMax-H3 and
-  HunyuanImage-3.0 do not batch requests in request mode, so the exception
-  applies only to Wan2.2 with `--max-num-seqs` above 1.
+  sequence. The response is HTTP 400 in both request and step mode. Request
+  mode preserves the error status for single requests and batches, including
+  when the stage uses `distributed_executor_backend: mp`.
 - `POST /v1/videos` creates the job first, so these errors appear on the job
   record and not in the response to the `POST`.
 
@@ -374,8 +369,8 @@ them.
 | --- | --- |
 | `--diffusion-compile-granularity full` | Rejected at startup. Use regional scope, which is the default. |
 | Cache backends (`--cache-backend`) | Rejected at startup, including when the default ranges are empty. |
-| MiniMax-H3 request-scoped Cache-DiT | In request mode, a request with `quality=high` whose schedule is non-empty is rejected before denoising. This includes a schedule inherited from the server's default ranges. The response is currently an HTTP 5xx whose text contains `attention_schedule cannot be combined with MiniMax H3 Cache-DiT`. Send `quality=lossless` or `"attention_schedule": []`. In step mode, `quality=high` is rejected with HTTP 400 for every request, with or without a schedule. See [Request-Scoped Quality](../cache_acceleration/cache_dit.md#request-scoped-quality-minimax-h3). |
-| MiniMax-H3 `latent_refine` | In request mode, a request with `latent_refine` whose schedule is non-empty is rejected before denoising. This includes a schedule inherited from the server's default ranges and a `latent_refine` value inherited from `--additional-config`. A server that sets both non-empty default ranges and a `latent_refine` default therefore rejects every request that overrides neither. The response is currently an HTTP 5xx whose text contains `attention_schedule cannot be combined with MiniMax H3 latent_refine`. Send `"attention_schedule": []` or `"latent_refine": false`. `latent_upscale` without `latent_refine` is accepted with a schedule. In step mode, `latent_refine` is rejected with HTTP 400 for every request, with or without a schedule. See [Latent super-resolution](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#latent-super-resolution) in the MiniMax-H3 recipe. |
+| MiniMax-H3 request-scoped Cache-DiT | In request mode, a request with `quality=high` whose schedule is non-empty is rejected before denoising. This includes a schedule inherited from the server's default ranges. The response is HTTP 400 with `attention_schedule cannot be combined with MiniMax H3 Cache-DiT` in the error message. Send `quality=lossless` or `"attention_schedule": []`. In step mode, `quality=high` is rejected with HTTP 400 for every request, with or without a schedule. See [Request-Scoped Quality](../cache_acceleration/cache_dit.md#request-scoped-quality-minimax-h3). |
+| MiniMax-H3 `latent_refine` | In request mode, a request with `latent_refine` whose schedule is non-empty is rejected before denoising. This includes a schedule inherited from the server's default ranges and a `latent_refine` value inherited from `--additional-config`. A server that sets both non-empty default ranges and a `latent_refine` default therefore rejects every request that overrides neither. The response is HTTP 400 with `attention_schedule cannot be combined with MiniMax H3 latent_refine` in the error message. Send `"attention_schedule": []` or `"latent_refine": false`. `latent_upscale` without `latent_refine` is accepted with a schedule. In step mode, `latent_refine` is rejected with HTTP 400 for every request, with or without a schedule. See [Latent super-resolution](https://github.com/vllm-project/vllm-omni/blob/main/recipes/MiniMaxAI/MiniMax-H3.md#latent-super-resolution) in the MiniMax-H3 recipe. |
 | Sequence parallelism on a model that pads the sequence | Applies to Ulysses, Ring, and AllGather-KV on Wan2.2 and HunyuanImage-3.0. MiniMax-H3 declares no sequence-parallel padding, so this check does not apply to it; its packed-sequence padding has its own limit, listed below the table. Every profile must select a backend with attention-mask support on every attention layer of the transformer, including cross-attention. The check runs at startup and does not depend on the request shape. The backends are listed below the table. |
 | Ring sequence parallelism | On layers that take part in sequence parallelism, a profile must not set `skip_softmax`. It must also resolve to the same backend as the base configuration, selected the same way (named explicitly in both, or left to the platform default in both), with the same backend options. A schedule therefore cannot change attention on those layers. |
 | AllGather-KV sequence parallelism | On layers that take part in sequence parallelism, a profile that resolves to `TRTLLM_ATTN` is rejected at startup, as for the base configuration. A `RAINFUSION_ATTN` profile with sparsity above 0 (the default is 0.8) is rejected on every layer that selects it. |
@@ -523,11 +518,18 @@ stays dense.
   for `/v1/videos/sync`, `/v1/images/generations`, `/v1/audio/speech`, the
   realtime video handler, and the chat request helper. `POST /v1/videos` uses
   the same handling code as `/v1/videos/sync` and has no test with a schedule.
-- The tests run on CPU with toy models and stand-in attention kernels. No
-  schedule has run on a GPU or an NPU, and no `TRTLLM_ATTN`, `FASTVIDEO_VSA`,
-  or `RAINFUSION_ATTN` kernel has run under a schedule.
-- No request with a schedule has been run on MiniMax-H3, Wan2.2, or
-  HunyuanImage-3.0. This guide therefore gives no speed or quality numbers.
+- CPU tests cover toy models and stand-in attention kernels. Real-weight
+  Wan2.2 T2V measurements have also run on a single NVIDIA B300 with dense
+  `TRTLLM_ATTN`, SAGE quantization, and Skip-Softmax. These measurements use
+  the in-process benchmark, not an HTTP server.
+- The latest SAGE run passed the benchmark's checks. The Skip-Softmax run
+  still failed the strict comparison between unscheduled baseline and
+  candidate output. Two separate runs of the unmodified baseline also
+  differed despite matching recorded inputs and effective configuration.
+  The cause remains unresolved, so these results do not establish a speed
+  or quality guarantee.
+- MiniMax-H3, HunyuanImage-3.0, NPU execution, `FASTVIDEO_VSA`, and
+  `RAINFUSION_ATTN` have not been validated with real scheduled inference.
 - The HTTP status codes and error bodies on this page come from reading the
   code and from handler tests, not from a running server.
 - Sequence parallelism with a schedule has not been run on multiple GPUs.
