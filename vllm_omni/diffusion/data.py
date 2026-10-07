@@ -2257,7 +2257,7 @@ class AttentionConfig:
 
 @dataclass
 class AttentionScheduleConfig:
-    """Startup-owned attention profiles and the default integer-step schedule.
+    """Startup-owned profiles with default integer-step ranges or normalized-noise windows.
 
     Profiles resolve their own roles, without merging the baseline or its
     environment fallback. Candidate construction and hardware validation happen
@@ -2266,6 +2266,7 @@ class AttentionScheduleConfig:
 
     profiles: dict[str, AttentionConfig] = field(default_factory=dict)
     default: AttentionSchedule = ()
+    # Ascending [low, high) windows; high=1 also includes 1. Cannot coexist with default ranges.
     sigma: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
