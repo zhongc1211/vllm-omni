@@ -43,7 +43,9 @@ def test_sigma_selection_uses_normalized_noise_and_gaps():
 
 
 def test_request_and_step_modes_share_batch_resolution():
-    service = type("Cfg", (), {"profiles": {"sparse": object()}, "sigma": [{"low": 0.8, "high": 1.0, "profile": "sparse"}]})()
+    service = type(
+        "Cfg", (), {"profiles": {"sparse": object()}, "sigma": [{"low": 0.8, "high": 1.0, "profile": "sparse"}]}
+    )()
     od_config = type("Od", (), {"diffusion_attention_schedule": service})()
     request = type("Req", (), {"sampling_params": type("S", (), {"attention_sigma_schedule": None})()})()
     state = type("State", (), {"sampling": type("S", (), {"attention_sigma_schedule": []})()})()
