@@ -21,6 +21,7 @@ For the internal selector, registry, and platform contract, see
 | Match training or rollout kernels loaded from Hugging Face | [Hugging Face Hub Backends](attention_backends/huggingface_hub.md) |
 | Use block-sparse video attention on Ascend NPU | [RainFusion](attention_backends/rainfusion.md) |
 | Use FastVideo VSA with FastWan2.2-TI2V-5B or FastH3 MiniMax-H3 on CUDA | [FastVideo VSA](attention_backends/fastvideo_vsa.md) |
+| Switch attention at fixed denoising steps | [Attention Schedules](attention_backends/schedules.md) |
 
 ## Backend options
 
